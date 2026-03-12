@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0d1b2a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>خدمة اعدادي</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="stylesheet" href="css/styles.css" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;800&display=swap" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<div id="loadingOverlay" class="loading-overlay"><div class="spinner"></div></div>
+<div id="toastContainer" class="toast-container"></div>
+
+<!-- AUTH VIEW -->
+<div id="authView" class="auth-view">
+  <div class="auth-card">
+    <div class="auth-logo">
+      <div class="auth-icon"><i class="fas fa-cross"></i></div>
+      <h1>خدمة اعدادي</h1>
+      <p>نظام حضور بتقنية NFC</p>
+    </div>
+    <div id="loginForm" class="auth-form">
+      <h2>تسجيل الدخول</h2>
+      <div class="form-group">
+        <label><i class="fas fa-phone"></i> رقم الهاتف</label>
+        <input type="tel" id="loginPhone" placeholder="01xxxxxxxxx" autocomplete="tel" />
+      </div>
+      <div class="form-group">
+        <label><i class="fas fa-lock"></i> كلمة المرور</label>
+        <input type="password" id="loginPassword" placeholder="أدخل كلمة المرور" autocomplete="current-password" />
+      </div>
+      <button class="btn btn-primary btn-full" onclick="handleLogin()">
+        <i class="fas fa-sign-in-alt"></i> دخول
+      </button>
+      <p class="auth-switch">ليس لديك حساب؟ <a onclick="toggleAuth()">سجل هنا</a></p>
+    </div>
+    <div id="registerForm" class="auth-form hidden">
+      <h2>تسجيل مشرف جديد</h2>
+      <div class="form-group">
+        <label><i class="fas fa-user"></i> الاسم الكامل</label>
+        <input type="text" id="regName" placeholder="اسمك الكامل" />
+      </div>
+      <div class="form-group">
+        <label><i class="fas fa-phone"></i> رقم الهاتف</label>
+        <input type="tel" id="regPhone" placeholder="01xxxxxxxxx" />
+      </div>
+      <div class="form-group">
+        <label><i class="fas fa-lock"></i> كلمة المرور</label>
+        <input type="password" id="regPassword" placeholder="4 أحرف على الأقل" />
+      </div>
+      <button class="btn btn-primary btn-full" onclick="handleRegister()">
+        <i class="fas fa-user-plus"></i> تسجيل
+      </button>
+      <p class="auth-switch">لديك حساب؟ <a onclick="toggleAuth()">سجل دخول</a></p>
+    </div>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="appView" class="app-view hidden">
+  <nav class="bottom-nav">
+    <a class="nav-tab active" data-view="dashboard" onclick="showView('dashboard')">
+      <i class="fas fa-church"></i><span>الرئيسية</span>
+    </a>
+    <a class="nav-tab" data-view="scan" onclick="showView('scan')">
+      <i class="fas fa-wifi"></i><span>مسح</span>
+    </a>
+    <a class="nav-tab" data-view="attendance" onclick="showView('attendance')">
+      <i class="fas fa-clipboard-list"></i><span>الحضور</span>
+    </a>
+    <a class="nav-tab" data-view="analytics" onclick="showView('analytics')">
+      <i class="fas fa-chart-bar"></i><span>إحصائيات</span>
+    </a>
+    <a class="nav-tab" data-view="employees" onclick="showView('employees')">
+      <i class="fas fa-users"></i><span>المخدومين</span>
+    </a>
+    <a class="nav-tab" data-view="settings" onclick="showView('settings')">
+      <i class="fas fa-cog"></i><span>إعدادات</span>
+    </a>
+  </nav>
+
+  <!-- DASHBOARD -->
+  <section id="view-dashboard" class="view active">
+    <header class="view-header">
+      <div>
+        <h1>✠ خدمة اعدادي</h1>
+        <p id="dashDate" class="subtitle"></p>
+      </div>
+      <div class="header-avatar" id="headerAvatar" onclick="showView('settings')"></div>
+    </header>
+    <div class="date-nav">
+      <button class="btn btn-icon" onclick="navigateDate(-1)"><i class="fas fa-chevron-right"></i></button>
+      <span id="dashDateLabel" class="date-label"></span>
+      <button class="btn btn-icon" onclick="navigateDate(1)"><i class="fas fa-chevron-left"></i></button>
+      <button class="btn btn-sm btn-secondary" onclick="goToToday()">اليوم</button>
+    </div>
+    <div class="stats-grid">
+      <div class="stat-card stat-blue" onclick="showView('employees')">
+        <i class="fas fa-users"></i>
+        <div class="stat-info"><span class="stat-value" id="statTotal">0</span><span class="stat-label">الإجمالي</span></div>
+      </div>
+      <div class="stat-card stat-green">
+        <i class="fas fa-check-circle"></i>
+        <div class="stat-info"><span class="stat-value" id="statPresent">0</span><span class="stat-label">حاضر</span></div>
+      </div>
+      <div class="stat-card stat-red">
+        <i class="fas fa-times-circle"></i>
+        <div class="stat-info"><span class="stat-value" id="statAbsent">0</span><span class="stat-label">غائب</span></div>
+      </div>
+      <div class="stat-card stat-orange">
+        <i class="fas fa-question-circle"></i>
+        <div class="stat-info"><span class="stat-value" id="statPending">0</span><span class="stat-label">لم يُسجل</span></div>
+      </div>
+    </div>
+    <div class="section-header"><h2><i class="fas fa-clock"></i> آخر التسجيلات</h2></div>
+    <div id="recentScans" class="card-list">
+      <div class="empty-state"><i class="fas fa-inbox"></i><p>لا توجد تسجيلات بعد</p></div>
+    </div>
+  </section>
+
+  <!-- NFC SCAN -->
+  <section id="view-scan" class="view">
+    <header class="view-header">
+      <h1><i class="fas fa-wifi"></i> مسح NFC</h1>
+      <span id="nfcBadge" class="nfc-status-badge"></span>
+    </header>
+    <div class="date-nav" style="margin-bottom:16px">
+      <button class="btn btn-icon" onclick="navigateScanDate(-1)"><i class="fas fa-chevron-right"></i></button>
+      <span id="scanDateLabel" class="date-label"></span>
+      <button class="btn btn-icon" onclick="navigateScanDate(1)"><i class="fas fa-chevron-left"></i></button>
+      <button class="btn btn-sm btn-secondary" onclick="goToTodayScan()">اليوم</button>
+    </div>
+    <div class="scan-area">
+      <div id="scanStatus" class="scan-circle" onclick="startNFCScan()">
+        <div class="scan-ripple"></div>
+        <i class="fas fa-wifi scan-icon"></i>
+        <span class="scan-text">اضغط للمسح</span>
+      </div>
+      <p class="scan-hint" id="scanHint">اضغط على الدائرة لبدء مسح NFC</p>
+      <div id="scanCounter" class="scan-counter hidden">
+        <i class="fas fa-check-circle"></i> <span id="scanCountValue">0</span> تم تسجيلهم
+      </div>
+      <div class="manual-entry">
+        <div class="manual-entry-header">
+          <i class="fas fa-keyboard"></i>
+          <p>إدخال معرف NFC يدوياً</p>
+        </div>
+        <p class="manual-hint">استخدم تطبيق NFC Tools لقراءة معرف البطاقة</p>
+        <div class="input-row">
+          <input type="text" id="manualNfcUid" placeholder="A1B2C3D4" onkeydown="if(event.key==='Enter')submitManualNfc()" autocomplete="off" autocapitalize="characters" />
+          <button class="btn btn-primary" onclick="submitManualNfc()"><i class="fas fa-arrow-left"></i></button>
+        </div>
+      </div>
+    </div>
+    <div id="scanResult" class="scan-result hidden"></div>
+  </section>
+
+  <!-- ATTENDANCE -->
+  <section id="view-attendance" class="view">
+    <header class="view-header">
+      <h1><i class="fas fa-clipboard-list"></i> سجل الحضور</h1>
+    </header>
+    <div class="date-nav">
+      <button class="btn btn-icon" onclick="navigateAttDate(-1)"><i class="fas fa-chevron-right"></i></button>
+      <span id="attDateLabel" class="date-label"></span>
+      <button class="btn btn-icon" onclick="navigateAttDate(1)"><i class="fas fa-chevron-left"></i></button>
+      <button class="btn btn-sm btn-secondary" onclick="goToTodayAtt()">اليوم</button>
+    </div>
+    <div class="filter-bar">
+      <button class="filter-btn active" data-filter="all" onclick="filterAttendance('all')">الكل</button>
+      <button class="filter-btn" data-filter="present" onclick="filterAttendance('present')">حاضر</button>
+      <button class="filter-btn" data-filter="absent" onclick="filterAttendance('absent')">غائب</button>
+      <button class="filter-btn" data-filter="not_scanned" onclick="filterAttendance('not_scanned')">لم يُسجل</button>
+    </div>
+    <div id="attendanceList" class="card-list">
+      <div class="empty-state"><i class="fas fa-clipboard"></i><p>لا يوجد مخدومين مسجلين بعد</p></div>
+    </div>
+  </section>
+
+  <!-- ANALYTICS -->
+  <section id="view-analytics" class="view">
+    <header class="view-header">
+      <h1><i class="fas fa-chart-bar"></i> الإحصائيات</h1>
+    </header>
+    <div id="analyticsContent">
+      <div class="empty-state"><div class="spinner"></div><p>جاري التحميل...</p></div>
+    </div>
+  </section>
+
+  <!-- EMPLOYEES -->
+  <section id="view-employees" class="view">
+    <header class="view-header">
+      <div><h1><i class="fas fa-users"></i> المخدومين</h1></div>
+      <button class="btn btn-primary btn-sm" onclick="showAddEmployeeModal()">
+        <i class="fas fa-plus"></i> إضافة
+      </button>
+    </header>
+    <div class="search-bar">
+      <i class="fas fa-search"></i>
+      <input type="text" id="employeeSearch" placeholder="بحث عن مخدوم..." oninput="searchEmployees(this.value)" />
+    </div>
+    <div id="employeeList" class="card-list"></div>
+  </section>
+
+  <!-- PROFILE -->
+  <section id="view-profile" class="view">
+    <header class="view-header">
+      <button class="btn btn-icon" onclick="goBack()"><i class="fas fa-arrow-right"></i></button>
+      <h1>الملف الشخصي</h1>
+      <button class="btn btn-icon" id="editProfileBtn" onclick="toggleEditProfile()"><i class="fas fa-pen"></i></button>
+    </header>
+    <div id="profileContent" class="profile-content"></div>
+  </section>
+
+  <!-- SUPERVISORS -->
+  <section id="view-supervisors" class="view">
+    <header class="view-header">
+      <button class="btn btn-icon" onclick="showView('settings')"><i class="fas fa-arrow-right"></i></button>
+      <h1><i class="fas fa-users-cog"></i> إدارة المشرفين</h1>
+    </header>
+    <div id="supervisorsList" class="card-list"></div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="view-settings" class="view">
+    <header class="view-header">
+      <h1><i class="fas fa-cog"></i> الإعدادات</h1>
+    </header>
+    <div class="settings-content">
+      <div class="settings-profile">
+        <div class="settings-avatar" id="settingsAvatar"></div>
+        <h2 id="settingsName">المشرف</h2>
+        <p id="settingsPhone">01xxxxxxxxx</p>
+      </div>
+      <div class="settings-group">
+        <div class="settings-item" onclick="showView('supervisors')">
+          <i class="fas fa-users-cog"></i>
+          <span>إدارة المشرفين</span>
+          <i class="fas fa-chevron-left"></i>
+        </div>
+        <div class="settings-item" onclick="exportAttendance()">
+          <i class="fas fa-file-export"></i>
+          <span>تصدير التقرير</span>
+          <i class="fas fa-chevron-left"></i>
+        </div>
+      </div>
+      <button class="btn btn-danger btn-full" onclick="handleLogout()" style="margin-top:24px">
+        <i class="fas fa-sign-out-alt"></i> تسجيل الخروج
+      </button>
+    </div>
+  </section>
+</div>
+
+<!-- EMPLOYEE MODAL -->
+<div id="employeeModal" class="modal hidden">
+  <div class="modal-backdrop" onclick="closeEmployeeModal()"></div>
+  <div class="modal-content">
+    <div class="modal-header">
+      <h2 id="modalTitle">تسجيل مخدوم</h2>
+      <button class="btn btn-icon" onclick="closeEmployeeModal()"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="empNfcUid" />
+      <div class="form-group">
+        <label>معرف NFC</label>
+        <input type="text" id="empNfcUidDisplay" placeholder="معرف بطاقة NFC" />
+      </div>
+      <div class="form-group">
+        <label>الاسم الكامل *</label>
+        <input type="text" id="empName" placeholder="اسم المخدوم" />
+      </div>
+      <div class="form-group">
+        <label>الفصل</label>
+        <input type="text" id="empClass" placeholder="الفصل" />
+      </div>
+      <div class="form-group">
+        <label>تاريخ الميلاد</label>
+        <input type="date" id="empBirthdate" />
+      </div>
+      <div class="form-group">
+        <label>رقم الهاتف</label>
+        <input type="tel" id="empPhone" placeholder="رقم الهاتف" />
+      </div>
+      <div class="form-group">
+        <label>تليفون ولي الأمر</label>
+        <input type="tel" id="empParentPhone" placeholder="تليفون ولي الأمر" />
+      </div>
+      <div class="form-group">
+        <label>أب الاعتراف</label>
+        <input type="text" id="empConfessionFather" placeholder="أب الاعتراف" />
+      </div>
+      <div class="form-group">
+        <label>العنوان</label>
+        <textarea id="empAddress" placeholder="عنوان المنزل" rows="2"></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeEmployeeModal()">إلغاء</button>
+      <button class="btn btn-primary" id="modalSaveBtn"><i class="fas fa-save"></i> حفظ</button>
+    </div>
+  </div>
+</div>
+
+<script src="js/app.js"></script>
+</body>
+</html>

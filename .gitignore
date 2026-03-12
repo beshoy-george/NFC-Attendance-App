@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+attendance.db
+cert.pem
+key.pem
+my_flask_app/
+*.db-wal
+*.db-shm
