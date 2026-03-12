@@ -1,83 +1,113 @@
 """
 NFC Attendance System - Backend
+Excel-based database + pywebview standalone window
 """
 
 from flask import Flask, jsonify, request, send_from_directory, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
-import sqlite3
+from openpyxl import Workbook, load_workbook
+import threading
 import os
+import sys
 from datetime import datetime, date, timedelta
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'nfc-attendance-secret-key-change-in-production')
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, 'attendance.db')
+# When running as a PyInstaller .exe, use the exe's directory for runtime files
+# and the bundled _MEIPASS directory for static assets
+if getattr(sys, 'frozen', False):
+    RUN_DIR = os.path.dirname(sys.executable)
+    BASE_DIR = sys._MEIPASS
+else:
+    RUN_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = RUN_DIR
+
+EXCEL_PATH = os.path.join(RUN_DIR, 'attendance_data.xlsx')
+_excel_lock = threading.Lock()
 
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+# ===== EXCEL DATABASE LAYER =====
+
+def _init_excel():
+    """Create the Excel file with proper sheets and headers if it doesn't exist."""
+    if os.path.exists(EXCEL_PATH):
+        return
+    wb = Workbook()
+    # Supervisors sheet
+    ws_sup = wb.active
+    ws_sup.title = 'Supervisors'
+    ws_sup.append(['id', 'name', 'phone', 'password_hash', 'created_at'])
+    # Employees sheet
+    ws_emp = wb.create_sheet('Employees')
+    ws_emp.append(['id', 'nfc_uid', 'name', 'birthdate', 'address', 'phone',
+                   'email', 'department', 'parent_phone', 'confession_father',
+                   'photo_url', 'created_at'])
+    # Attendance sheet
+    ws_att = wb.create_sheet('Attendance')
+    ws_att.append(['id', 'employee_id', 'supervisor_id', 'scan_time', 'status', 'notes'])
+    wb.save(EXCEL_PATH)
 
 
-def init_db():
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.executescript('''
-        CREATE TABLE IF NOT EXISTS supervisors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS employees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nfc_uid TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            birthdate TEXT,
-            address TEXT,
-            phone TEXT,
-            email TEXT,
-            department TEXT,
-            parent_phone TEXT,
-            confession_father TEXT,
-            photo_url TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS attendance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER NOT NULL,
-            supervisor_id INTEGER NOT NULL,
-            scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status TEXT NOT NULL DEFAULT 'present',
-            notes TEXT,
-            FOREIGN KEY (employee_id) REFERENCES employees(id),
-            FOREIGN KEY (supervisor_id) REFERENCES supervisors(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_attendance_employee ON attendance(employee_id);
-        CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(scan_time);
-        CREATE INDEX IF NOT EXISTS idx_employees_nfc ON employees(nfc_uid);
-    ''')
-    # Migration: add new columns if they don't exist
-    existing_cols = [row['name'] for row in conn.execute("PRAGMA table_info(employees)").fetchall()]
-    if 'parent_phone' not in existing_cols:
-        conn.execute("ALTER TABLE employees ADD COLUMN parent_phone TEXT")
-    if 'confession_father' not in existing_cols:
-        conn.execute("ALTER TABLE employees ADD COLUMN confession_father TEXT")
-    # Migration: supervisors email -> phone
-    sup_cols = [row['name'] for row in conn.execute("PRAGMA table_info(supervisors)").fetchall()]
-    if 'phone' not in sup_cols and 'email' in sup_cols:
-        conn.execute("ALTER TABLE supervisors RENAME COLUMN email TO phone")
-    conn.commit()
-    conn.close()
+def _load_wb():
+    return load_workbook(EXCEL_PATH)
 
 
-init_db()
+def _next_id(ws):
+    """Get next auto-increment ID for a sheet."""
+    max_id = 0
+    for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+        if row[0] is not None:
+            try:
+                max_id = max(max_id, int(row[0]))
+            except (ValueError, TypeError):
+                pass
+    return max_id + 1
+
+
+def _sheet_to_dicts(ws):
+    """Convert a worksheet to a list of dicts using the header row as keys."""
+    rows = list(ws.iter_rows(values_only=True))
+    if len(rows) < 1:
+        return []
+    headers = [str(h) for h in rows[0]]
+    result = []
+    for row in rows[1:]:
+        if row[0] is None:
+            continue
+        d = {}
+        for i, h in enumerate(headers):
+            val = row[i] if i < len(row) else None
+            d[h] = val if val is not None else ''
+        result.append(d)
+    return result
+
+
+def _find_row_by_id(ws, record_id):
+    """Find row number (1-indexed) by ID in column 1. Returns None if not found."""
+    for row_num in range(2, ws.max_row + 1):
+        cell_val = ws.cell(row=row_num, column=1).value
+        if cell_val is not None and int(cell_val) == int(record_id):
+            return row_num
+    return None
+
+
+def _get_headers(ws):
+    return [str(ws.cell(row=1, column=c).value) for c in range(1, ws.max_column + 1)]
+
+
+def _row_to_dict(ws, row_num):
+    headers = _get_headers(ws)
+    d = {}
+    for i, h in enumerate(headers):
+        val = ws.cell(row=row_num, column=i + 1).value
+        d[h] = val if val is not None else ''
+    return d
+
+
+# ===== INIT =====
+_init_excel()
 
 
 def login_required(f):
@@ -96,7 +126,7 @@ def get_nearest_friday(d=None):
     return d - timedelta(days=days_since_friday)
 
 
-# STATIC FILE SERVING
+# ===== STATIC FILE SERVING =====
 
 @app.route('/')
 def serve_index():
@@ -119,7 +149,7 @@ def serve_sw():
     return send_from_directory(BASE_DIR, 'sw.js')
 
 
-# AUTH ENDPOINTS
+# ===== AUTH ENDPOINTS =====
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
@@ -131,22 +161,21 @@ def register():
         return jsonify({'error': 'All fields required'}), 400
     if len(password) < 4:
         return jsonify({'error': 'Password must be at least 4 characters'}), 400
-    conn = get_db()
-    try:
-        conn.execute(
-            'INSERT INTO supervisors (name, phone, password_hash) VALUES (?, ?, ?)',
-            (name, phone, generate_password_hash(password))
-        )
-        conn.commit()
-        supervisor = conn.execute(
-            'SELECT id, name, phone FROM supervisors WHERE phone = ?', (phone,)
-        ).fetchone()
-        session['supervisor_id'] = supervisor['id']
-        return jsonify({'message': 'OK', 'supervisor': dict(supervisor)}), 201
-    except sqlite3.IntegrityError:
-        return jsonify({'error': 'Phone already registered'}), 409
-    finally:
-        conn.close()
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Supervisors']
+        # Check uniqueness
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row[0] is not None and str(row[2]) == phone:
+                wb.close()
+                return jsonify({'error': 'Phone already registered'}), 409
+        new_id = _next_id(ws)
+        ws.append([new_id, name, phone, generate_password_hash(password),
+                   datetime.now().isoformat()])
+        wb.save(EXCEL_PATH)
+        wb.close()
+    session['supervisor_id'] = new_id
+    return jsonify({'message': 'OK', 'supervisor': {'id': new_id, 'name': name, 'phone': phone}}), 201
 
 
 @app.route('/api/auth/login', methods=['POST'])
@@ -154,15 +183,22 @@ def login():
     data = request.json
     phone = data.get('phone', '').strip()
     password = data.get('password', '')
-    conn = get_db()
-    supervisor = conn.execute('SELECT * FROM supervisors WHERE phone = ?', (phone,)).fetchone()
-    conn.close()
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Supervisors']
+        supervisors = _sheet_to_dicts(ws)
+        wb.close()
+    supervisor = None
+    for s in supervisors:
+        if str(s['phone']) == phone:
+            supervisor = s
+            break
     if not supervisor or not check_password_hash(supervisor['password_hash'], password):
         return jsonify({'error': 'Invalid credentials'}), 401
-    session['supervisor_id'] = supervisor['id']
+    session['supervisor_id'] = int(supervisor['id'])
     return jsonify({
         'message': 'OK',
-        'supervisor': {'id': supervisor['id'], 'name': supervisor['name'], 'phone': supervisor['phone']}
+        'supervisor': {'id': int(supervisor['id']), 'name': supervisor['name'], 'phone': supervisor['phone']}
     })
 
 
@@ -176,27 +212,40 @@ def logout():
 def auth_me():
     if 'supervisor_id' not in session:
         return jsonify({'authenticated': False}), 401
-    conn = get_db()
-    supervisor = conn.execute(
-        'SELECT id, name, phone FROM supervisors WHERE id = ?', (session['supervisor_id'],)
-    ).fetchone()
-    conn.close()
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Supervisors']
+        supervisors = _sheet_to_dicts(ws)
+        wb.close()
+    supervisor = None
+    for s in supervisors:
+        if int(s['id']) == session['supervisor_id']:
+            supervisor = s
+            break
     if not supervisor:
         session.clear()
         return jsonify({'authenticated': False}), 401
-    return jsonify({'authenticated': True, 'supervisor': dict(supervisor)})
+    return jsonify({'authenticated': True, 'supervisor': {
+        'id': int(supervisor['id']), 'name': supervisor['name'], 'phone': supervisor['phone']
+    }})
 
 
 @app.route('/api/supervisors', methods=['GET'])
 @login_required
 def list_supervisors():
-    conn = get_db()
-    supervisors = conn.execute('SELECT id, name, phone, created_at FROM supervisors ORDER BY name').fetchall()
-    conn.close()
-    return jsonify([dict(s) for s in supervisors])
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Supervisors']
+        supervisors = _sheet_to_dicts(ws)
+        wb.close()
+    result = sorted([{
+        'id': int(s['id']), 'name': s['name'], 'phone': s['phone'],
+        'created_at': s.get('created_at', '')
+    } for s in supervisors], key=lambda x: x['name'])
+    return jsonify(result)
 
 
-# NFC SCAN
+# ===== NFC SCAN =====
 
 @app.route('/api/nfc/scan', methods=['POST'])
 @login_required
@@ -206,34 +255,47 @@ def nfc_scan():
     scan_date = data.get('date', date.today().isoformat())
     if not nfc_uid:
         return jsonify({'error': 'NFC UID required'}), 400
-    conn = get_db()
-    employee = conn.execute('SELECT * FROM employees WHERE nfc_uid = ?', (nfc_uid,)).fetchone()
-    if not employee:
-        conn.close()
-        return jsonify({'status': 'unknown', 'nfc_uid': nfc_uid, 'message': 'Unknown card'})
-    day_start = scan_date + ' 00:00:00'
-    day_end = scan_date + ' 23:59:59'
-    existing = conn.execute(
-        'SELECT * FROM attendance WHERE employee_id = ? AND scan_time BETWEEN ? AND ?',
-        (employee['id'], day_start, day_end)
-    ).fetchone()
-    if existing:
-        conn.close()
-        return jsonify({
-            'status': 'already_scanned', 'employee': dict(employee),
-            'scan_time': existing['scan_time'],
-            'message': employee['name'] + ' already scanned'
-        })
-    now_time = datetime.now().strftime('%H:%M:%S')
-    record_time = scan_date + ' ' + now_time
-    conn.execute(
-        'INSERT INTO attendance (employee_id, supervisor_id, scan_time, status) VALUES (?, ?, ?, ?)',
-        (employee['id'], session['supervisor_id'], record_time, 'present')
-    )
-    conn.commit()
-    conn.close()
+    with _excel_lock:
+        wb = _load_wb()
+        ws_emp = wb['Employees']
+        employees = _sheet_to_dicts(ws_emp)
+        employee = None
+        for e in employees:
+            if str(e['nfc_uid']).upper() == nfc_uid:
+                employee = e
+                break
+        if not employee:
+            wb.close()
+            return jsonify({'status': 'unknown', 'nfc_uid': nfc_uid, 'message': 'Unknown card'})
+        # Check if already scanned today
+        ws_att = wb['Attendance']
+        attendance = _sheet_to_dicts(ws_att)
+        day_start = scan_date + ' 00:00:00'
+        day_end = scan_date + ' 23:59:59'
+        existing = None
+        for a in attendance:
+            if (int(a['employee_id']) == int(employee['id']) and
+                    str(a['scan_time']) >= day_start and str(a['scan_time']) <= day_end):
+                existing = a
+                break
+        if existing:
+            wb.close()
+            emp_dict = {k: (int(v) if k == 'id' else v) for k, v in employee.items()}
+            return jsonify({
+                'status': 'already_scanned', 'employee': emp_dict,
+                'scan_time': existing['scan_time'],
+                'message': employee['name'] + ' already scanned'
+            })
+        # Record attendance
+        now_time = datetime.now().strftime('%H:%M:%S')
+        record_time = scan_date + ' ' + now_time
+        new_id = _next_id(ws_att)
+        ws_att.append([new_id, int(employee['id']), session['supervisor_id'], record_time, 'present', ''])
+        wb.save(EXCEL_PATH)
+        wb.close()
+    emp_dict = {k: (int(v) if k == 'id' else v) for k, v in employee.items()}
     return jsonify({
-        'status': 'recorded', 'employee': dict(employee),
+        'status': 'recorded', 'employee': emp_dict,
         'scan_time': record_time, 'message': 'Recorded ' + employee['name']
     })
 
@@ -248,39 +310,50 @@ def manual_attendance():
     record_date = data.get('date', date.today().isoformat())
     if not employee_id:
         return jsonify({'error': 'Employee ID required'}), 400
-    conn = get_db()
-    day_start = record_date + ' 00:00:00'
-    day_end = record_date + ' 23:59:59'
-    existing = conn.execute(
-        'SELECT id FROM attendance WHERE employee_id = ? AND scan_time BETWEEN ? AND ?',
-        (employee_id, day_start, day_end)
-    ).fetchone()
-    now_time = datetime.now().strftime('%H:%M:%S')
-    record_time = record_date + ' ' + now_time
-    if existing:
-        conn.execute(
-            'UPDATE attendance SET status = ?, notes = ?, supervisor_id = ? WHERE id = ?',
-            (status, notes, session['supervisor_id'], existing['id'])
-        )
-    else:
-        conn.execute(
-            'INSERT INTO attendance (employee_id, supervisor_id, scan_time, status, notes) VALUES (?, ?, ?, ?, ?)',
-            (employee_id, session['supervisor_id'], record_time, status, notes)
-        )
-    conn.commit()
-    conn.close()
+    employee_id = int(employee_id)
+    with _excel_lock:
+        wb = _load_wb()
+        ws_att = wb['Attendance']
+        attendance = _sheet_to_dicts(ws_att)
+        day_start = record_date + ' 00:00:00'
+        day_end = record_date + ' 23:59:59'
+        existing = None
+        for a in attendance:
+            if (int(a['employee_id']) == employee_id and
+                    str(a['scan_time']) >= day_start and str(a['scan_time']) <= day_end):
+                existing = a
+                break
+        now_time = datetime.now().strftime('%H:%M:%S')
+        record_time = record_date + ' ' + now_time
+        if existing:
+            row_num = _find_row_by_id(ws_att, existing['id'])
+            if row_num:
+                headers = _get_headers(ws_att)
+                ws_att.cell(row=row_num, column=headers.index('status') + 1, value=status)
+                ws_att.cell(row=row_num, column=headers.index('notes') + 1, value=notes)
+                ws_att.cell(row=row_num, column=headers.index('supervisor_id') + 1, value=session['supervisor_id'])
+        else:
+            new_id = _next_id(ws_att)
+            ws_att.append([new_id, employee_id, session['supervisor_id'], record_time, status, notes])
+        wb.save(EXCEL_PATH)
+        wb.close()
     return jsonify({'message': 'OK', 'status': status})
 
 
-# EMPLOYEE ENDPOINTS
+# ===== EMPLOYEE ENDPOINTS =====
 
 @app.route('/api/employees', methods=['GET'])
 @login_required
 def list_employees():
-    conn = get_db()
-    employees = conn.execute('SELECT * FROM employees ORDER BY name').fetchall()
-    conn.close()
-    return jsonify([dict(e) for e in employees])
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Employees']
+        employees = _sheet_to_dicts(ws)
+        wb.close()
+    for e in employees:
+        e['id'] = int(e['id'])
+    employees.sort(key=lambda x: x['name'])
+    return jsonify(employees)
 
 
 @app.route('/api/employees', methods=['POST'])
@@ -291,36 +364,57 @@ def create_employee():
     name = data.get('name', '').strip()
     if not nfc_uid or not name:
         return jsonify({'error': 'NFC UID and name required'}), 400
-    conn = get_db()
-    try:
-        cursor = conn.execute(
-            'INSERT INTO employees (nfc_uid, name, birthdate, address, phone, parent_phone, confession_father, department) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            (nfc_uid, name, data.get('birthdate', ''), data.get('address', ''),
-             data.get('phone', ''), data.get('parent_phone', ''),
-             data.get('confession_father', ''), data.get('class_name', ''))
-        )
-        conn.commit()
-        employee = conn.execute('SELECT * FROM employees WHERE id = ?', (cursor.lastrowid,)).fetchone()
-        conn.close()
-        return jsonify({'message': 'OK', 'employee': dict(employee)}), 201
-    except sqlite3.IntegrityError:
-        conn.close()
-        return jsonify({'error': 'NFC UID already registered'}), 409
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Employees']
+        # Check uniqueness
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row[0] is not None and str(row[1]).upper() == nfc_uid:
+                wb.close()
+                return jsonify({'error': 'NFC UID already registered'}), 409
+        new_id = _next_id(ws)
+        ws.append([new_id, nfc_uid, name, data.get('birthdate', ''),
+                   data.get('address', ''), data.get('phone', ''),
+                   data.get('email', ''), data.get('class_name', ''),
+                   data.get('parent_phone', ''), data.get('confession_father', ''),
+                   '', datetime.now().isoformat()])
+        wb.save(EXCEL_PATH)
+        # Read back the employee
+        employee = _row_to_dict(ws, ws.max_row)
+        employee['id'] = int(employee['id'])
+        wb.close()
+    return jsonify({'message': 'OK', 'employee': employee}), 201
 
 
 @app.route('/api/employees/<int:emp_id>', methods=['GET'])
 @login_required
 def get_employee(emp_id):
-    conn = get_db()
-    employee = conn.execute('SELECT * FROM employees WHERE id = ?', (emp_id,)).fetchone()
-    if not employee:
-        conn.close()
-        return jsonify({'error': 'Not found'}), 404
-    attendance = conn.execute(
-        'SELECT a.*, s.name as supervisor_name FROM attendance a '
-        'JOIN supervisors s ON a.supervisor_id = s.id '
-        'WHERE a.employee_id = ? ORDER BY a.scan_time DESC', (emp_id,)
-    ).fetchall()
+    with _excel_lock:
+        wb = _load_wb()
+        ws_emp = wb['Employees']
+        row_num = _find_row_by_id(ws_emp, emp_id)
+        if not row_num:
+            wb.close()
+            return jsonify({'error': 'Not found'}), 404
+        employee = _row_to_dict(ws_emp, row_num)
+        employee['id'] = int(employee['id'])
+        # Get attendance records
+        ws_att = wb['Attendance']
+        all_att = _sheet_to_dicts(ws_att)
+        ws_sup = wb['Supervisors']
+        all_sup = _sheet_to_dicts(ws_sup)
+        wb.close()
+    sup_map = {int(s['id']): s['name'] for s in all_sup}
+    attendance = []
+    for a in all_att:
+        if int(a['employee_id']) == emp_id:
+            rec = dict(a)
+            rec['id'] = int(rec['id'])
+            rec['employee_id'] = int(rec['employee_id'])
+            rec['supervisor_id'] = int(rec['supervisor_id'])
+            rec['supervisor_name'] = sup_map.get(int(a['supervisor_id']), '')
+            attendance.append(rec)
+    attendance.sort(key=lambda x: str(x['scan_time']), reverse=True)
     total_records = len(attendance)
     present_count = sum(1 for a in attendance if a['status'] == 'present')
     absent_count = sum(1 for a in attendance if a['status'] == 'absent')
@@ -331,18 +425,18 @@ def get_employee(emp_id):
         friday = get_nearest_friday(today - timedelta(weeks=i))
         fri_start = friday.isoformat() + ' 00:00:00'
         fri_end = friday.isoformat() + ' 23:59:59'
-        record = conn.execute(
-            'SELECT status FROM attendance WHERE employee_id = ? AND scan_time BETWEEN ? AND ?',
-            (emp_id, fri_start, fri_end)
-        ).fetchone()
+        record = None
+        for a in attendance:
+            if fri_start <= str(a['scan_time']) <= fri_end:
+                record = a
+                break
         weekly.append({
             'date': friday.isoformat(),
             'status': record['status'] if record else 'absent'
         })
-    conn.close()
     return jsonify({
-        'employee': dict(employee),
-        'attendance': [dict(a) for a in attendance],
+        'employee': employee,
+        'attendance': attendance,
         'stats': {
             'total_records': total_records, 'present': present_count, 'absent': absent_count,
             'rate': round((present_count / total_records * 100) if total_records > 0 else 0, 1)
@@ -355,133 +449,175 @@ def get_employee(emp_id):
 @login_required
 def update_employee(emp_id):
     data = request.json
-    conn = get_db()
-    employee = conn.execute('SELECT * FROM employees WHERE id = ?', (emp_id,)).fetchone()
-    if not employee:
-        conn.close()
-        return jsonify({'error': 'Not found'}), 404
-    conn.execute(
-        'UPDATE employees SET name=?, birthdate=?, address=?, phone=?, parent_phone=?, confession_father=?, department=? WHERE id=?',
-        (data.get('name', employee['name']), data.get('birthdate', employee['birthdate']),
-         data.get('address', employee['address']), data.get('phone', employee['phone']),
-         data.get('parent_phone', employee['parent_phone']),
-         data.get('confession_father', employee['confession_father']),
-         data.get('class_name', employee['department']), emp_id)
-    )
-    conn.commit()
-    updated = conn.execute('SELECT * FROM employees WHERE id = ?', (emp_id,)).fetchone()
-    conn.close()
-    return jsonify({'message': 'OK', 'employee': dict(updated)})
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Employees']
+        row_num = _find_row_by_id(ws, emp_id)
+        if not row_num:
+            wb.close()
+            return jsonify({'error': 'Not found'}), 404
+        headers = _get_headers(ws)
+        old = _row_to_dict(ws, row_num)
+        field_map = {
+            'name': data.get('name', old['name']),
+            'birthdate': data.get('birthdate', old['birthdate']),
+            'address': data.get('address', old['address']),
+            'phone': data.get('phone', old['phone']),
+            'parent_phone': data.get('parent_phone', old['parent_phone']),
+            'confession_father': data.get('confession_father', old['confession_father']),
+            'department': data.get('class_name', old['department']),
+        }
+        for field, value in field_map.items():
+            if field in headers:
+                ws.cell(row=row_num, column=headers.index(field) + 1, value=value)
+        wb.save(EXCEL_PATH)
+        updated = _row_to_dict(ws, row_num)
+        updated['id'] = int(updated['id'])
+        wb.close()
+    return jsonify({'message': 'OK', 'employee': updated})
 
 
 @app.route('/api/employees/<int:emp_id>', methods=['DELETE'])
 @login_required
 def delete_employee(emp_id):
-    conn = get_db()
-    conn.execute('DELETE FROM attendance WHERE employee_id = ?', (emp_id,))
-    conn.execute('DELETE FROM employees WHERE id = ?', (emp_id,))
-    conn.commit()
-    conn.close()
+    with _excel_lock:
+        wb = _load_wb()
+        # Delete attendance records
+        ws_att = wb['Attendance']
+        rows_to_delete = []
+        for row_num in range(2, ws_att.max_row + 1):
+            val = ws_att.cell(row=row_num, column=2).value
+            if val is not None and int(val) == emp_id:
+                rows_to_delete.append(row_num)
+        for row_num in reversed(rows_to_delete):
+            ws_att.delete_rows(row_num)
+        # Delete employee
+        ws_emp = wb['Employees']
+        emp_row = _find_row_by_id(ws_emp, emp_id)
+        if emp_row:
+            ws_emp.delete_rows(emp_row)
+        wb.save(EXCEL_PATH)
+        wb.close()
     return jsonify({'message': 'OK'})
 
 
-# DASHBOARD
+# ===== DASHBOARD =====
 
 @app.route('/api/dashboard', methods=['GET'])
 @login_required
 def dashboard():
     target_date = request.args.get('date', date.today().isoformat())
-    conn = get_db()
-    total_employees = conn.execute('SELECT COUNT(*) as c FROM employees').fetchone()['c']
+    with _excel_lock:
+        wb = _load_wb()
+        employees = _sheet_to_dicts(wb['Employees'])
+        attendance = _sheet_to_dicts(wb['Attendance'])
+        supervisors = _sheet_to_dicts(wb['Supervisors'])
+        wb.close()
+    total_employees = len(employees)
+    total_supervisors = len(supervisors)
     day_start = target_date + ' 00:00:00'
     day_end = target_date + ' 23:59:59'
-    today_present = conn.execute(
-        "SELECT COUNT(*) as c FROM attendance WHERE scan_time BETWEEN ? AND ? AND status = 'present'",
-        (day_start, day_end)
-    ).fetchone()['c']
-    today_absent = conn.execute(
-        "SELECT COUNT(*) as c FROM attendance WHERE scan_time BETWEEN ? AND ? AND status = 'absent'",
-        (day_start, day_end)
-    ).fetchone()['c']
-    recent = conn.execute(
-        'SELECT a.*, e.name as employee_name, e.nfc_uid, s.name as supervisor_name '
-        'FROM attendance a JOIN employees e ON a.employee_id = e.id '
-        'JOIN supervisors s ON a.supervisor_id = s.id '
-        'WHERE a.scan_time BETWEEN ? AND ? '
-        'ORDER BY a.scan_time DESC LIMIT 20', (day_start, day_end)
-    ).fetchall()
-    total_supervisors = conn.execute('SELECT COUNT(*) as c FROM supervisors').fetchone()['c']
-    conn.close()
+    day_records = [a for a in attendance if day_start <= str(a['scan_time']) <= day_end]
+    today_present = sum(1 for a in day_records if a['status'] == 'present')
+    today_absent = sum(1 for a in day_records if a['status'] == 'absent')
+    emp_map = {int(e['id']): e['name'] for e in employees}
+    sup_map = {int(s['id']): s['name'] for s in supervisors}
+    recent = []
+    for a in sorted(day_records, key=lambda x: str(x['scan_time']), reverse=True)[:20]:
+        recent.append({
+            'employee_id': int(a['employee_id']),
+            'employee_name': emp_map.get(int(a['employee_id']), ''),
+            'nfc_uid': next((e.get('nfc_uid', '') for e in employees if int(e['id']) == int(a['employee_id'])), ''),
+            'supervisor_name': sup_map.get(int(a['supervisor_id']), ''),
+            'scan_time': a['scan_time'], 'status': a['status']
+        })
     return jsonify({
         'total_employees': total_employees, 'today_present': today_present,
         'today_absent': today_absent,
         'today_not_scanned': max(0, total_employees - today_present - today_absent),
         'total_supervisors': total_supervisors,
-        'recent_scans': [dict(r) for r in recent], 'date': target_date
+        'recent_scans': recent, 'date': target_date
     })
 
 
-# ATTENDANCE BY DATE
+# ===== ATTENDANCE BY DATE =====
 
 @app.route('/api/attendance/date', methods=['GET'])
 @login_required
 def attendance_by_date():
     target_date = request.args.get('date', date.today().isoformat())
-    conn = get_db()
+    with _excel_lock:
+        wb = _load_wb()
+        employees = _sheet_to_dicts(wb['Employees'])
+        attendance = _sheet_to_dicts(wb['Attendance'])
+        supervisors = _sheet_to_dicts(wb['Supervisors'])
+        wb.close()
     day_start = target_date + ' 00:00:00'
     day_end = target_date + ' 23:59:59'
-    employees = conn.execute('SELECT * FROM employees ORDER BY name').fetchall()
+    sup_map = {int(s['id']): s['name'] for s in supervisors}
     result = []
-    for emp in employees:
-        record = conn.execute(
-            'SELECT a.*, s.name as supervisor_name FROM attendance a '
-            'JOIN supervisors s ON a.supervisor_id = s.id '
-            'WHERE a.employee_id = ? AND a.scan_time BETWEEN ? AND ?',
-            (emp['id'], day_start, day_end)
-        ).fetchone()
+    for emp in sorted(employees, key=lambda x: x['name']):
+        record = None
+        for a in attendance:
+            if (int(a['employee_id']) == int(emp['id']) and
+                    day_start <= str(a['scan_time']) <= day_end):
+                record = a
+                break
+        emp_dict = dict(emp)
+        emp_dict['id'] = int(emp_dict['id'])
         result.append({
-            'employee': dict(emp),
+            'employee': emp_dict,
             'status': record['status'] if record else 'not_scanned',
             'scan_time': record['scan_time'] if record else None,
-            'supervisor': record['supervisor_name'] if record else None
+            'supervisor': sup_map.get(int(record['supervisor_id']), '') if record else None
         })
-    conn.close()
     return jsonify(result)
 
 
 @app.route('/api/attendance/today', methods=['GET'])
 @login_required
 def today_attendance():
-    conn = get_db()
-    today_start = date.today().isoformat() + ' 00:00:00'
-    today_end = date.today().isoformat() + ' 23:59:59'
-    employees = conn.execute('SELECT * FROM employees ORDER BY name').fetchall()
+    with _excel_lock:
+        wb = _load_wb()
+        employees = _sheet_to_dicts(wb['Employees'])
+        attendance = _sheet_to_dicts(wb['Attendance'])
+        supervisors = _sheet_to_dicts(wb['Supervisors'])
+        wb.close()
+    today_str = date.today().isoformat()
+    day_start = today_str + ' 00:00:00'
+    day_end = today_str + ' 23:59:59'
+    sup_map = {int(s['id']): s['name'] for s in supervisors}
     result = []
-    for emp in employees:
-        record = conn.execute(
-            'SELECT a.*, s.name as supervisor_name FROM attendance a '
-            'JOIN supervisors s ON a.supervisor_id = s.id '
-            'WHERE a.employee_id = ? AND a.scan_time BETWEEN ? AND ?',
-            (emp['id'], today_start, today_end)
-        ).fetchone()
+    for emp in sorted(employees, key=lambda x: x['name']):
+        record = None
+        for a in attendance:
+            if (int(a['employee_id']) == int(emp['id']) and
+                    day_start <= str(a['scan_time']) <= day_end):
+                record = a
+                break
+        emp_dict = dict(emp)
+        emp_dict['id'] = int(emp_dict['id'])
         result.append({
-            'employee': dict(emp),
+            'employee': emp_dict,
             'status': record['status'] if record else 'not_scanned',
             'scan_time': record['scan_time'] if record else None,
-            'supervisor': record['supervisor_name'] if record else None
+            'supervisor': sup_map.get(int(record['supervisor_id']), '') if record else None
         })
-    conn.close()
     return jsonify(result)
 
 
-# ANALYTICS
+# ===== ANALYTICS =====
 
 @app.route('/api/analytics', methods=['GET'])
 @login_required
 def analytics():
     weeks = int(request.args.get('weeks', 12))
-    conn = get_db()
-    total_employees = conn.execute('SELECT COUNT(*) as c FROM employees').fetchone()['c']
+    with _excel_lock:
+        wb = _load_wb()
+        employees = _sheet_to_dicts(wb['Employees'])
+        attendance = _sheet_to_dicts(wb['Attendance'])
+        wb.close()
+    total_employees = len(employees)
     # Weekly attendance trend
     weekly_trend = []
     today = date.today()
@@ -489,61 +625,43 @@ def analytics():
         friday = get_nearest_friday(today - timedelta(weeks=i))
         fri_start = friday.isoformat() + ' 00:00:00'
         fri_end = friday.isoformat() + ' 23:59:59'
-        present = conn.execute(
-            "SELECT COUNT(*) as c FROM attendance WHERE scan_time BETWEEN ? AND ? AND status = 'present'",
-            (fri_start, fri_end)
-        ).fetchone()['c']
-        absent = conn.execute(
-            "SELECT COUNT(*) as c FROM attendance WHERE scan_time BETWEEN ? AND ? AND status = 'absent'",
-            (fri_start, fri_end)
-        ).fetchone()['c']
+        day_records = [a for a in attendance if fri_start <= str(a['scan_time']) <= fri_end]
+        present = sum(1 for a in day_records if a['status'] == 'present')
+        absent = sum(1 for a in day_records if a['status'] == 'absent')
         weekly_trend.append({
             'date': friday.isoformat(), 'present': present, 'absent': absent, 'total': total_employees
         })
     # Per-attendee stats
-    employees = conn.execute('SELECT id, name, department FROM employees ORDER BY name').fetchall()
     attendee_stats = []
     for emp in employees:
-        present = conn.execute(
-            "SELECT COUNT(*) as c FROM attendance WHERE employee_id = ? AND status = 'present'",
-            (emp['id'],)
-        ).fetchone()['c']
-        total = conn.execute(
-            "SELECT COUNT(*) as c FROM attendance WHERE employee_id = ?",
-            (emp['id'],)
-        ).fetchone()['c']
+        emp_att = [a for a in attendance if int(a['employee_id']) == int(emp['id'])]
+        present = sum(1 for a in emp_att if a['status'] == 'present')
+        total = len(emp_att)
         rate = round((present / total * 100) if total > 0 else 0, 1)
         attendee_stats.append({
-            'id': emp['id'], 'name': emp['name'], 'class_name': emp['department'],
+            'id': int(emp['id']), 'name': emp['name'], 'class_name': emp.get('department', ''),
             'present': present, 'total': total, 'rate': rate
         })
     attendee_stats.sort(key=lambda x: x['rate'], reverse=True)
     # Class breakdown
     classes = {}
     for emp in employees:
-        cls = emp['department'] or 'Other'
+        cls = emp.get('department', '') or 'Other'
         if cls not in classes:
             classes[cls] = {'name': cls, 'count': 0, 'total_present': 0, 'total_records': 0}
         classes[cls]['count'] += 1
-        present = conn.execute(
-            "SELECT COUNT(*) as c FROM attendance WHERE employee_id = ? AND status = 'present'",
-            (emp['id'],)
-        ).fetchone()['c']
-        total = conn.execute(
-            "SELECT COUNT(*) as c FROM attendance WHERE employee_id = ?",
-            (emp['id'],)
-        ).fetchone()['c']
+        emp_att = [a for a in attendance if int(a['employee_id']) == int(emp['id'])]
+        present = sum(1 for a in emp_att if a['status'] == 'present')
         classes[cls]['total_present'] += present
-        classes[cls]['total_records'] += total
+        classes[cls]['total_records'] += len(emp_att)
     class_stats = []
     for cls_data in classes.values():
         rate = round((cls_data['total_present'] / cls_data['total_records'] * 100) if cls_data['total_records'] > 0 else 0, 1)
         class_stats.append({**cls_data, 'rate': rate})
     # Overall
-    total_attendance = conn.execute("SELECT COUNT(*) as c FROM attendance").fetchone()['c']
-    total_present = conn.execute("SELECT COUNT(*) as c FROM attendance WHERE status = 'present'").fetchone()['c']
+    total_attendance = len(attendance)
+    total_present = sum(1 for a in attendance if a['status'] == 'present')
     overall_rate = round((total_present / total_attendance * 100) if total_attendance > 0 else 0, 1)
-    conn.close()
     return jsonify({
         'total_employees': total_employees, 'overall_rate': overall_rate,
         'total_attendance_records': total_attendance, 'total_present': total_present,
@@ -556,20 +674,36 @@ def analytics():
 def attendance_report():
     start_date = request.args.get('start', (date.today() - timedelta(days=90)).isoformat())
     end_date = request.args.get('end', date.today().isoformat())
-    conn = get_db()
-    records = conn.execute(
-        'SELECT a.*, e.name as employee_name, e.nfc_uid, s.name as supervisor_name '
-        'FROM attendance a JOIN employees e ON a.employee_id = e.id '
-        'JOIN supervisors s ON a.supervisor_id = s.id '
-        'WHERE DATE(a.scan_time) BETWEEN ? AND ? '
-        'ORDER BY a.scan_time DESC', (start_date, end_date)
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in records])
+    with _excel_lock:
+        wb = _load_wb()
+        attendance = _sheet_to_dicts(wb['Attendance'])
+        employees = _sheet_to_dicts(wb['Employees'])
+        supervisors = _sheet_to_dicts(wb['Supervisors'])
+        wb.close()
+    emp_map = {int(e['id']): e for e in employees}
+    sup_map = {int(s['id']): s['name'] for s in supervisors}
+    records = []
+    for a in attendance:
+        scan_date_str = str(a['scan_time']).split(' ')[0] if a['scan_time'] else ''
+        if start_date <= scan_date_str <= end_date:
+            emp = emp_map.get(int(a['employee_id']), {})
+            records.append({
+                'id': int(a['id']), 'employee_id': int(a['employee_id']),
+                'supervisor_id': int(a['supervisor_id']),
+                'scan_time': a['scan_time'], 'status': a['status'],
+                'notes': a.get('notes', ''),
+                'employee_name': emp.get('name', ''),
+                'nfc_uid': emp.get('nfc_uid', ''),
+                'supervisor_name': sup_map.get(int(a['supervisor_id']), '')
+            })
+    records.sort(key=lambda x: str(x['scan_time']), reverse=True)
+    return jsonify(records)
 
+
+# ===== MAIN =====
 
 if __name__ == '__main__':
-    import ssl, socket
+    import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('8.8.8.8', 80))
@@ -578,8 +712,9 @@ if __name__ == '__main__':
         local_ip = '0.0.0.0'
     finally:
         s.close()
-    cert_file = os.path.join(BASE_DIR, 'cert.pem')
-    key_file = os.path.join(BASE_DIR, 'key.pem')
+
+    cert_file = os.path.join(RUN_DIR, 'cert.pem')
+    key_file = os.path.join(RUN_DIR, 'key.pem')
     if not os.path.exists(cert_file) or not os.path.exists(key_file):
         from OpenSSL import crypto
         k = crypto.PKey()
@@ -596,11 +731,31 @@ if __name__ == '__main__':
             f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
         with open(key_file, 'wb') as f:
             f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
-        print("SSL certificate generated.")
+
     print("=" * 50)
     print("  NFC Attendance System")
     print("=" * 50)
-    print(f"  Local:   https://localhost:5000")
     print(f"  Phone:   https://{local_ip}:5000")
     print("=" * 50)
-    app.run(host='0.0.0.0', port=5000, debug=True, ssl_context=(cert_file, key_file))
+
+    # Start Flask in a background thread
+    flask_thread = threading.Thread(
+        target=lambda: app.run(
+            host='0.0.0.0', port=5000, debug=False,
+            ssl_context=(cert_file, key_file),
+            use_reloader=False
+        ),
+        daemon=True
+    )
+    flask_thread.start()
+
+    # Open pywebview standalone window (desktop app)
+    import webview
+    webview.create_window(
+        'خدمة اعدادي - NFC Attendance',
+        'https://localhost:5000',
+        width=420, height=780,
+        resizable=True,
+        min_size=(360, 600)
+    )
+    webview.start(ssl=True)

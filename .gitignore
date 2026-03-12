@@ -2,8 +2,12 @@
 __pycache__/
 *.pyc
 attendance.db
+attendance_data.xlsx
 cert.pem
 key.pem
 my_flask_app/
 *.db-wal
 *.db-shm
+dist/
+build/
+*.spec
