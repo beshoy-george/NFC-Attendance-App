@@ -10,6 +10,10 @@ from openpyxl import Workbook, load_workbook
 import threading
 import os
 import sys
+import re
+import random
+import base64
+from urllib import parse, request as urlrequest, error as urlerror
 from datetime import datetime, date, timedelta
 
 app = Flask(__name__)
@@ -26,6 +30,11 @@ else:
 
 EXCEL_PATH = os.path.join(RUN_DIR, 'attendance_data.xlsx')
 _excel_lock = threading.Lock()
+_otp_lock = threading.Lock()
+OTP_STORE = {}
+
+OTP_TTL_MINUTES = int(os.environ.get('OTP_TTL_MINUTES', '5'))
+OTP_MAX_ATTEMPTS = int(os.environ.get('OTP_MAX_ATTEMPTS', '5'))
 
 
 # ===== EXCEL DATABASE LAYER =====
@@ -126,6 +135,77 @@ def get_nearest_friday(d=None):
     return d - timedelta(days=days_since_friday)
 
 
+def normalize_phone(phone):
+    """Keep only digits to normalize phone numbers before comparison/storage."""
+    return ''.join(ch for ch in str(phone) if ch.isdigit())
+
+
+def is_valid_phone(phone):
+    """Validate Egyptian mobile numbers (11 digits starting with 01)."""
+    return bool(re.fullmatch(r"01\d{9}", phone))
+
+
+def to_e164_eg(phone):
+    """Convert local Egyptian mobile number to E.164 format for SMS providers."""
+    normalized = normalize_phone(phone)
+    if normalized.startswith('01') and len(normalized) == 11:
+        return '+2' + normalized
+    return normalized
+
+
+def generate_otp_code():
+    return f"{random.randint(0, 999999):06d}"
+
+
+def cleanup_expired_otps():
+    now = datetime.now()
+    with _otp_lock:
+        expired_phones = [p for p, data in OTP_STORE.items() if data['expires_at'] < now]
+        for p in expired_phones:
+            OTP_STORE.pop(p, None)
+
+
+def send_sms_otp(phone, otp_code):
+    """
+    Send OTP via SMS.
+    Modes:
+    - SMS_MODE=twilio with TWILIO_* vars for real SMS
+    - default simulated mode (no external dependency)
+    """
+    sms_mode = os.environ.get('SMS_MODE', 'simulated').strip().lower()
+    if sms_mode != 'twilio':
+        return {'sent': True, 'simulated': True, 'message': 'SIMULATED_SMS'}
+
+    account_sid = os.environ.get('TWILIO_ACCOUNT_SID', '').strip()
+    auth_token = os.environ.get('TWILIO_AUTH_TOKEN', '').strip()
+    from_number = os.environ.get('TWILIO_FROM_NUMBER', '').strip()
+    to_number = to_e164_eg(phone)
+    if not account_sid or not auth_token or not from_number:
+        return {'sent': False, 'simulated': False, 'error': 'Twilio credentials are not configured'}
+
+    endpoint = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    payload = parse.urlencode({
+        'From': from_number,
+        'To': to_number,
+        'Body': f'Your OTP code is: {otp_code}. It expires in {OTP_TTL_MINUTES} minutes.'
+    }).encode('utf-8')
+
+    basic_auth = base64.b64encode(f"{account_sid}:{auth_token}".encode('utf-8')).decode('utf-8')
+    req = urlrequest.Request(endpoint, data=payload, method='POST')
+    req.add_header('Authorization', f'Basic {basic_auth}')
+    req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            if 200 <= resp.status < 300:
+                return {'sent': True, 'simulated': False}
+            return {'sent': False, 'simulated': False, 'error': f'SMS provider returned {resp.status}'}
+    except urlerror.HTTPError as exc:
+        return {'sent': False, 'simulated': False, 'error': f'SMS provider HTTP error {exc.code}'}
+    except Exception as exc:
+        return {'sent': False, 'simulated': False, 'error': str(exc)}
+
+
 # ===== STATIC FILE SERVING =====
 
 @app.route('/')
@@ -155,10 +235,12 @@ def serve_sw():
 def register():
     data = request.json
     name = data.get('name', '').strip()
-    phone = data.get('phone', '').strip()
+    phone = normalize_phone(data.get('phone', '').strip())
     password = data.get('password', '')
     if not name or not phone or not password:
         return jsonify({'error': 'All fields required'}), 400
+    if not is_valid_phone(phone):
+        return jsonify({'error': 'Invalid phone number. Use 11 digits starting with 01'}), 400
     if len(password) < 4:
         return jsonify({'error': 'Password must be at least 4 characters'}), 400
     with _excel_lock:
@@ -166,7 +248,7 @@ def register():
         ws = wb['Supervisors']
         # Check uniqueness
         for row in ws.iter_rows(min_row=2, values_only=True):
-            if row[0] is not None and str(row[2]) == phone:
+            if row[0] is not None and normalize_phone(row[2]) == phone:
                 wb.close()
                 return jsonify({'error': 'Phone already registered'}), 409
         new_id = _next_id(ws)
@@ -181,8 +263,10 @@ def register():
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     data = request.json
-    phone = data.get('phone', '').strip()
+    phone = normalize_phone(data.get('phone', '').strip())
     password = data.get('password', '')
+    if not is_valid_phone(phone):
+        return jsonify({'error': 'Invalid phone number'}), 400
     with _excel_lock:
         wb = _load_wb()
         ws = wb['Supervisors']
@@ -190,7 +274,7 @@ def login():
         wb.close()
     supervisor = None
     for s in supervisors:
-        if str(s['phone']) == phone:
+        if normalize_phone(s['phone']) == phone:
             supervisor = s
             break
     if not supervisor or not check_password_hash(supervisor['password_hash'], password):
@@ -200,6 +284,110 @@ def login():
         'message': 'OK',
         'supervisor': {'id': int(supervisor['id']), 'name': supervisor['name'], 'phone': supervisor['phone']}
     })
+
+
+@app.route('/api/auth/forgot-password/request-otp', methods=['POST'])
+def forgot_password_request_otp():
+    data = request.json
+    phone = normalize_phone(data.get('phone', '').strip())
+    if not phone:
+        return jsonify({'error': 'Phone is required'}), 400
+    if not is_valid_phone(phone):
+        return jsonify({'error': 'Invalid phone number. Use 11 digits starting with 01'}), 400
+
+    cleanup_expired_otps()
+
+    # Check phone exists
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Supervisors']
+        phone_exists = False
+        for row_num in range(2, ws.max_row + 1):
+            row_phone = normalize_phone(ws.cell(row=row_num, column=3).value)
+            if row_phone == phone:
+                phone_exists = True
+                break
+        wb.close()
+
+    if not phone_exists:
+        return jsonify({'error': 'Phone number not found'}), 404
+
+    otp_code = generate_otp_code()
+    expires_at = datetime.now() + timedelta(minutes=OTP_TTL_MINUTES)
+    with _otp_lock:
+        OTP_STORE[phone] = {
+            'otp_code': otp_code,
+            'expires_at': expires_at,
+            'attempts': 0
+        }
+
+    sms_result = send_sms_otp(phone, otp_code)
+    if not sms_result.get('sent'):
+        return jsonify({'error': sms_result.get('error', 'Failed to send OTP')}), 500
+
+    response = {
+        'message': f'OTP has been sent. It expires in {OTP_TTL_MINUTES} minutes.'
+    }
+    if sms_result.get('simulated'):
+        # Dev/testing mode only; real SMS mode never exposes OTP in API response.
+        response['simulated'] = True
+        response['otp_preview'] = otp_code
+
+    return jsonify(response)
+
+
+@app.route('/api/auth/forgot-password/verify-otp', methods=['POST'])
+def forgot_password_verify_otp():
+    data = request.json
+    phone = normalize_phone(data.get('phone', '').strip())
+    otp_code = str(data.get('otp_code', '')).strip()
+    new_password = data.get('new_password', '')
+
+    if not phone or not otp_code or not new_password:
+        return jsonify({'error': 'Phone, OTP, and new password are required'}), 400
+    if not is_valid_phone(phone):
+        return jsonify({'error': 'Invalid phone number. Use 11 digits starting with 01'}), 400
+    if not re.fullmatch(r'\d{6}', otp_code):
+        return jsonify({'error': 'OTP must be 6 digits'}), 400
+    if len(new_password) < 4:
+        return jsonify({'error': 'Password must be at least 4 characters'}), 400
+
+    cleanup_expired_otps()
+
+    with _otp_lock:
+        otp_data = OTP_STORE.get(phone)
+        if not otp_data:
+            return jsonify({'error': 'OTP not found or expired. Request a new code.'}), 400
+        if otp_data['attempts'] >= OTP_MAX_ATTEMPTS:
+            OTP_STORE.pop(phone, None)
+            return jsonify({'error': 'Too many attempts. Request a new OTP.'}), 429
+        if otp_data['otp_code'] != otp_code:
+            otp_data['attempts'] += 1
+            return jsonify({'error': 'Invalid OTP code'}), 400
+
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Supervisors']
+        target_row = None
+        for row_num in range(2, ws.max_row + 1):
+            row_phone = normalize_phone(ws.cell(row=row_num, column=3).value)
+            if row_phone == phone:
+                target_row = row_num
+                break
+        if not target_row:
+            wb.close()
+            with _otp_lock:
+                OTP_STORE.pop(phone, None)
+            return jsonify({'error': 'Phone number not found'}), 404
+
+        ws.cell(row=target_row, column=4, value=generate_password_hash(new_password))
+        wb.save(EXCEL_PATH)
+        wb.close()
+
+    with _otp_lock:
+        OTP_STORE.pop(phone, None)
+
+    return jsonify({'message': 'Password has been reset successfully'})
 
 
 @app.route('/api/auth/logout', methods=['POST'])

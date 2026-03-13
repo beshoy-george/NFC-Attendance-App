@@ -17,6 +17,24 @@ const state = {
   editingEmployee: null
 };
 
+const PENDING_SCAN_KEY = 'pending_nfc_scans_v1';
+const SUPERVISOR_CACHE_KEY = 'cached_supervisor_v1';
+let syncInProgress = false;
+
+// ===== OFFLINE AUTH CACHE =====
+function saveSupervisorCache(supervisor) {
+  try { localStorage.setItem(SUPERVISOR_CACHE_KEY, JSON.stringify(supervisor)); } catch (e) {}
+}
+function loadSupervisorCache() {
+  try {
+    const raw = localStorage.getItem(SUPERVISOR_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+function clearSupervisorCache() {
+  localStorage.removeItem(SUPERVISOR_CACHE_KEY);
+}
+
 // ===== DATE HELPERS =====
 function getNearestFriday(d) {
   if (!d) d = new Date();
@@ -119,10 +137,121 @@ function goBack() {
 }
 
 // ===== AUTH =====
+function normalizePhone(phone) {
+  return (phone || '').replace(/\D/g, '');
+}
+
+function isValidPhone(phone) {
+  return /^01\d{9}$/.test(phone);
+}
+
+function getPendingScans() {
+  try {
+    const raw = localStorage.getItem(PENDING_SCAN_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function setPendingScans(scans) {
+  localStorage.setItem(PENDING_SCAN_KEY, JSON.stringify(scans));
+}
+
+function pendingScanCount() {
+  return getPendingScans().length;
+}
+
+function updatePendingSyncHint() {
+  const hint = document.getElementById('scanHint');
+  if (!hint) return;
+  const pending = pendingScanCount();
+  if (pending > 0) {
+    hint.textContent = `يوجد ${pending} عملية مسح محفوظة وستتم مزامنتها تلقائياً`;
+  } else if (!state.scanning) {
+    hint.textContent = 'اضغط على الدائرة لبدء مسح NFC';
+  }
+}
+
+function enqueueOfflineScan(uid, scanDate) {
+  const pending = getPendingScans();
+  const exists = pending.some(item => item.uid === uid && item.scanDate === scanDate);
+  if (!exists) {
+    pending.push({ uid, scanDate, queuedAt: new Date().toISOString() });
+    setPendingScans(pending);
+  }
+  updatePendingSyncHint();
+}
+
+async function sendNfcScanRequest(uid, scanDate) {
+  const res = await fetch('/api/nfc/scan', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nfc_uid: uid, date: scanDate })
+  });
+  const data = await res.json();
+  return { res, data };
+}
+
+async function flushPendingNfcScans(showSummary = false) {
+  if (syncInProgress) return;
+  if (!state.supervisor) return;
+  const pending = getPendingScans();
+  if (pending.length === 0) return;
+
+  syncInProgress = true;
+  let synced = 0;
+  const remaining = [];
+
+  for (const item of pending) {
+    try {
+      const { res, data } = await sendNfcScanRequest(item.uid, item.scanDate);
+      // Successful API processing or duplicate-day scan are considered synced.
+      if (res.ok && ['recorded', 'already_scanned', 'unknown'].includes(data.status)) {
+        synced++;
+      } else if (res.status === 401) {
+        // Need active login session; keep for later.
+        remaining.push(item);
+      } else {
+        remaining.push(item);
+      }
+    } catch (e) {
+      remaining.push(item);
+    }
+  }
+
+  setPendingScans(remaining);
+  updatePendingSyncHint();
+  if (showSummary && synced > 0) {
+    showToast(`تمت مزامنة ${synced} عملية مسح محفوظة`, 'success');
+  }
+  syncInProgress = false;
+}
+
+function setupOfflineSync() {
+  window.addEventListener('online', async () => {
+    // Try to re-verify session with server (PC may have restarted)
+    try {
+      const res = await fetch('/api/auth/me');
+      const data = await res.json();
+      if (data.authenticated) {
+        state.supervisor = data.supervisor;
+        saveSupervisorCache(data.supervisor);
+      }
+    } catch (e) { /* still offline */ }
+    flushPendingNfcScans(true);
+  });
+  // Periodic best-effort sync while app is open.
+  setInterval(() => {
+    flushPendingNfcScans(false);
+  }, 15000);
+}
+
 async function handleLogin() {
-  const phone = document.getElementById('loginPhone').value.trim();
+  const phone = normalizePhone(document.getElementById('loginPhone').value.trim());
   const password = document.getElementById('loginPassword').value;
   if (!phone || !password) { showToast('يرجى ملء جميع الحقول', 'error'); return; }
+  if (!isValidPhone(phone)) { showToast('رقم الهاتف غير صحيح (11 رقم ويبدأ بـ 01)', 'error'); return; }
   showLoading();
   try {
     const res = await fetch('/api/auth/login', {
@@ -132,7 +261,9 @@ async function handleLogin() {
     const data = await res.json();
     if (res.ok) {
       state.supervisor = data.supervisor;
+      saveSupervisorCache(data.supervisor);
       showApp();
+      flushPendingNfcScans(true);
       showToast('أهلاً ' + data.supervisor.name, 'success');
     } else {
       showToast(data.error || 'بيانات غير صحيحة', 'error');
@@ -145,9 +276,10 @@ async function handleLogin() {
 
 async function handleRegister() {
   const name = document.getElementById('regName').value.trim();
-  const phone = document.getElementById('regPhone').value.trim();
+  const phone = normalizePhone(document.getElementById('regPhone').value.trim());
   const password = document.getElementById('regPassword').value;
   if (!name || !phone || !password) { showToast('يرجى ملء جميع الحقول', 'error'); return; }
+  if (!isValidPhone(phone)) { showToast('رقم الهاتف غير صحيح (11 رقم ويبدأ بـ 01)', 'error'); return; }
   if (password.length < 4) { showToast('كلمة المرور يجب أن تكون 4 أحرف على الأقل', 'error'); return; }
   showLoading();
   try {
@@ -158,6 +290,7 @@ async function handleRegister() {
     const data = await res.json();
     if (res.ok) {
       state.supervisor = data.supervisor;
+      saveSupervisorCache(data.supervisor);
       showApp();
       showToast('تم التسجيل بنجاح', 'success');
     } else {
@@ -170,16 +303,119 @@ async function handleRegister() {
 }
 
 async function handleLogout() {
-  await fetch('/api/auth/logout', { method: 'POST' });
+  await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
   state.supervisor = null;
+  clearSupervisorCache();
   document.getElementById('authView').classList.remove('hidden');
   document.getElementById('appView').classList.add('hidden');
+  showLoginForm();
   showToast('تم تسجيل الخروج', 'info');
 }
 
 function toggleAuth() {
+  document.getElementById('forgotForm').classList.add('hidden');
   document.getElementById('loginForm').classList.toggle('hidden');
   document.getElementById('registerForm').classList.toggle('hidden');
+}
+
+function showForgotPassword() {
+  document.getElementById('loginForm').classList.add('hidden');
+  document.getElementById('registerForm').classList.add('hidden');
+  document.getElementById('forgotForm').classList.remove('hidden');
+  document.getElementById('forgotPhone').value = '';
+  document.getElementById('forgotOtp').value = '';
+  document.getElementById('forgotPassword').value = '';
+  document.getElementById('forgotPasswordConfirm').value = '';
+}
+
+function showLoginForm() {
+  document.getElementById('forgotForm').classList.add('hidden');
+  document.getElementById('registerForm').classList.add('hidden');
+  document.getElementById('loginForm').classList.remove('hidden');
+}
+
+async function sendResetOtp() {
+  const phone = normalizePhone(document.getElementById('forgotPhone').value.trim());
+  if (!phone) {
+    showToast('أدخل رقم الهاتف أولاً', 'error');
+    return;
+  }
+  if (!isValidPhone(phone)) {
+    showToast('رقم الهاتف غير صحيح (11 رقم ويبدأ بـ 01)', 'error');
+    return;
+  }
+
+  showLoading();
+  try {
+    const res = await fetch('/api/auth/forgot-password/request-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      if (data.simulated && data.otp_preview) {
+        showToast(`تم إرسال OTP تجريبي: ${data.otp_preview}`, 'info');
+      } else {
+        showToast('تم إرسال OTP على رقم الهاتف', 'success');
+      }
+    } else {
+      showToast(data.error || 'تعذر إرسال OTP', 'error');
+    }
+  } catch (e) {
+    showToast('خطأ في الاتصال', 'error');
+  }
+  hideLoading();
+}
+
+async function handleForgotPassword() {
+  const phone = normalizePhone(document.getElementById('forgotPhone').value.trim());
+  const otpCode = document.getElementById('forgotOtp').value.trim();
+  const newPassword = document.getElementById('forgotPassword').value;
+  const confirmPassword = document.getElementById('forgotPasswordConfirm').value;
+
+  if (!phone || !otpCode || !newPassword || !confirmPassword) {
+    showToast('يرجى ملء جميع الحقول', 'error');
+    return;
+  }
+  if (!isValidPhone(phone)) {
+    showToast('رقم الهاتف غير صحيح (11 رقم ويبدأ بـ 01)', 'error');
+    return;
+  }
+  if (!/^\d{6}$/.test(otpCode)) {
+    showToast('رمز OTP يجب أن يكون 6 أرقام', 'error');
+    return;
+  }
+  if (newPassword.length < 4) {
+    showToast('كلمة المرور يجب أن تكون 4 أحرف على الأقل', 'error');
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    showToast('كلمتا المرور غير متطابقتين', 'error');
+    return;
+  }
+
+  showLoading();
+  try {
+    const res = await fetch('/api/auth/forgot-password/verify-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone, otp_code: otpCode, new_password: newPassword })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      document.getElementById('forgotOtp').value = '';
+      document.getElementById('forgotPassword').value = '';
+      document.getElementById('forgotPasswordConfirm').value = '';
+      showToast('تم تحديث كلمة المرور بنجاح عبر OTP', 'success');
+      showLoginForm();
+    } else {
+      showToast(data.error || 'تعذر تحديث كلمة المرور', 'error');
+    }
+  } catch (e) {
+    showToast('خطأ في الاتصال', 'error');
+  }
+  hideLoading();
 }
 
 function showApp() {
@@ -239,6 +475,8 @@ function initScanView() {
     badge.textContent = 'NFC غير متاح';
     badge.className = 'nfc-status-badge nfc-unsupported';
   }
+  updatePendingSyncHint();
+  flushPendingNfcScans(false);
 }
 
 async function startNFCScan() {
@@ -286,12 +524,9 @@ async function processNfcScan(uid) {
   const now = Date.now();
   if (now - lastScanTime < 2000) return;
   lastScanTime = now;
+  const scanDate = formatDateISO(state.scanDate);
   try {
-    const res = await fetch('/api/nfc/scan', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nfc_uid: uid, date: formatDateISO(state.scanDate) })
-    });
-    const data = await res.json();
+    const { data } = await sendNfcScanRequest(uid, scanDate);
     showScanResult(data);
     if (data.status === 'recorded') {
       state.scanCount++;
@@ -299,7 +534,8 @@ async function processNfcScan(uid) {
       document.getElementById('scanCountValue').textContent = state.scanCount;
     }
   } catch (e) {
-    showToast('خطأ في الاتصال', 'error');
+    enqueueOfflineScan(uid, scanDate);
+    showToast('لا يوجد اتصال بالخادم. تم حفظ المسح وسيتم مزامنته تلقائياً', 'warning');
   }
 }
 
@@ -754,14 +990,27 @@ function getAvatarColor(name) {
 
 // ===== INIT =====
 async function init() {
+  setupOfflineSync();
   try {
     const res = await fetch('/api/auth/me');
     const data = await res.json();
     if (data.authenticated) {
       state.supervisor = data.supervisor;
+      saveSupervisorCache(data.supervisor);   // refresh cache whenever server is reachable
       showApp();
+      flushPendingNfcScans(false);
     }
-  } catch (e) { /* not logged in */ }
+  } catch (e) {
+    // Server unreachable — restore from cached session so NFC scanning still works offline
+    const cached = loadSupervisorCache();
+    if (cached) {
+      state.supervisor = cached;
+      showApp();
+      showToast('وضع بدون اتصال — المسح سيُحفظ ويُزامَن تلقائياً', 'warning');
+      updatePendingSyncHint();
+    }
+    // else: no cache → user must log in when server is back
+  }
 }
 
 document.addEventListener('DOMContentLoaded', init);

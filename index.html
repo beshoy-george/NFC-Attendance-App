@@ -39,6 +39,7 @@
       <button class="btn btn-primary btn-full" onclick="handleLogin()">
         <i class="fas fa-sign-in-alt"></i> دخول
       </button>
+      <p class="auth-switch"><a onclick="showForgotPassword()">نسيت كلمة المرور؟</a></p>
       <p class="auth-switch">ليس لديك حساب؟ <a onclick="toggleAuth()">سجل هنا</a></p>
     </div>
     <div id="registerForm" class="auth-form hidden">
@@ -59,6 +60,32 @@
         <i class="fas fa-user-plus"></i> تسجيل
       </button>
       <p class="auth-switch">لديك حساب؟ <a onclick="toggleAuth()">سجل دخول</a></p>
+    </div>
+    <div id="forgotForm" class="auth-form hidden">
+      <h2>استعادة كلمة المرور عبر OTP</h2>
+      <div class="form-group">
+        <label><i class="fas fa-phone"></i> رقم الهاتف</label>
+        <input type="tel" id="forgotPhone" placeholder="01xxxxxxxxx" autocomplete="tel" />
+      </div>
+      <button class="btn btn-primary btn-full" onclick="sendResetOtp()">
+        <i class="fas fa-paper-plane"></i> إرسال رمز OTP
+      </button>
+      <div class="form-group">
+        <label><i class="fas fa-shield-alt"></i> رمز OTP</label>
+        <input type="text" id="forgotOtp" placeholder="6 أرقام" maxlength="6" autocomplete="one-time-code" />
+      </div>
+      <div class="form-group">
+        <label><i class="fas fa-lock"></i> كلمة المرور الجديدة</label>
+        <input type="password" id="forgotPassword" placeholder="4 أحرف على الأقل" autocomplete="new-password" />
+      </div>
+      <div class="form-group">
+        <label><i class="fas fa-check"></i> تأكيد كلمة المرور</label>
+        <input type="password" id="forgotPasswordConfirm" placeholder="أعد كتابة كلمة المرور" autocomplete="new-password" />
+      </div>
+      <button class="btn btn-primary btn-full" onclick="handleForgotPassword()">
+        <i class="fas fa-key"></i> تأكيد OTP وتحديث كلمة المرور
+      </button>
+      <p class="auth-switch">تذكرت كلمة المرور؟ <a onclick="showLoginForm()">العودة لتسجيل الدخول</a></p>
     </div>
   </div>
 </div>
