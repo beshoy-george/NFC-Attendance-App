@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d1b2a" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>خدمة اعدادي</title>
+  <title>مدارس الاحد</title>
   <link rel="manifest" href="manifest.json" />
   <link rel="stylesheet" href="css/styles.css" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;800&display=swap" />
@@ -23,7 +23,7 @@
   <div class="auth-card">
     <div class="auth-logo">
       <div class="auth-icon"><i class="fas fa-cross"></i></div>
-      <h1>خدمة اعدادي</h1>
+      <h1>مدارس الاحد</h1>
       <p>نظام حضور بتقنية NFC</p>
     </div>
     <div id="loginForm" class="auth-form">
@@ -43,7 +43,7 @@
       <p class="auth-switch">ليس لديك حساب؟ <a onclick="toggleAuth()">سجل هنا</a></p>
     </div>
     <div id="registerForm" class="auth-form hidden">
-      <h2>تسجيل مشرف جديد</h2>
+      <h2>تسجيل خادم جديد</h2>
       <div class="form-group">
         <label><i class="fas fa-user"></i> الاسم الكامل</label>
         <input type="text" id="regName" placeholder="اسمك الكامل" />
@@ -55,6 +55,18 @@
       <div class="form-group">
         <label><i class="fas fa-lock"></i> كلمة المرور</label>
         <input type="password" id="regPassword" placeholder="4 أحرف على الأقل" />
+      </div>
+      <div class="form-group">
+        <label><i class="fas fa-server"></i> الخدمة</label>
+        <select id="regService" onchange="onRegServiceChange()">
+          <option value="">-- اختر الخدمة --</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label><i class="fas fa-layer-group"></i> المرحلة</label>
+        <select id="regStage" disabled>
+          <option value="">-- اختر المرحلة --</option>
+        </select>
       </div>
       <button class="btn btn-primary btn-full" onclick="handleRegister()">
         <i class="fas fa-user-plus"></i> تسجيل
@@ -92,36 +104,61 @@
 
 <!-- MAIN APP -->
 <div id="appView" class="app-view hidden">
-  <nav class="bottom-nav">
-    <a class="nav-tab active" data-view="dashboard" onclick="showView('dashboard')">
-      <i class="fas fa-church"></i><span>الرئيسية</span>
-    </a>
-    <a class="nav-tab" data-view="scan" onclick="showView('scan')">
-      <i class="fas fa-wifi"></i><span>مسح</span>
-    </a>
-    <a class="nav-tab" data-view="attendance" onclick="showView('attendance')">
-      <i class="fas fa-clipboard-list"></i><span>الحضور</span>
-    </a>
-    <a class="nav-tab" data-view="analytics" onclick="showView('analytics')">
-      <i class="fas fa-chart-bar"></i><span>إحصائيات</span>
-    </a>
-    <a class="nav-tab" data-view="employees" onclick="showView('employees')">
-      <i class="fas fa-users"></i><span>المخدومين</span>
-    </a>
-    <a class="nav-tab" data-view="settings" onclick="showView('settings')">
-      <i class="fas fa-cog"></i><span>إعدادات</span>
-    </a>
+  <!-- TOP APP BAR -->
+  <header class="app-bar">
+    <button class="btn btn-icon" onclick="toggleDrawer()"><i class="fas fa-bars"></i></button>
+    <h1 class="app-bar-title">&#10016; مدارس الاحد</h1>
+    <div class="header-actions">
+      <div class="sync-indicator" id="syncIndicator" onclick="flushPendingWrites();flushPendingNfcScans(true);" title="مزامنة البيانات">
+        <i class="fas fa-sync-alt"></i>
+        <span class="sync-badge" id="syncBadge" style="display:none">0</span>
+      </div>
+      <div class="header-avatar" id="headerAvatar" onclick="showView('settings')"></div>
+    </div>
+  </header>
+  <div class="offline-indicator" id="offlineIndicator"><i class="fas fa-wifi-slash"></i> غير متصل</div>
+
+  <!-- SIDE DRAWER (overlay) -->
+  <div id="drawerOverlay" class="drawer-overlay" onclick="closeDrawer()"></div>
+  <nav id="sideDrawer" class="side-drawer">
+    <div class="drawer-header">
+      <div class="drawer-avatar" id="drawerAvatar"></div>
+      <div class="drawer-user-info">
+        <span class="drawer-user-name" id="drawerUserName">الخادم</span>
+        <span class="drawer-user-badge" id="drawerAdminBadge" style="display:none">المدير العام</span>
+      </div>
+    </div>
+    <div class="drawer-nav">
+      <a class="drawer-item active" data-view="dashboard" onclick="showView('dashboard')">
+        <i class="fas fa-church"></i><span>الرئيسية</span>
+      </a>
+      <a class="drawer-item" data-view="scan" onclick="showView('scan')">
+        <i class="fas fa-wifi"></i><span>مسح NFC</span>
+      </a>
+      <a class="drawer-item" data-view="attendance" onclick="showView('attendance')">
+        <i class="fas fa-clipboard-list"></i><span>سجل الحضور</span>
+      </a>
+      <a class="drawer-item" data-view="analytics" onclick="showView('analytics')">
+        <i class="fas fa-chart-bar"></i><span>الإحصائيات</span>
+      </a>
+      <a class="drawer-item" data-view="employees" onclick="showView('employees')">
+        <i class="fas fa-users"></i><span>المخدومين</span>
+      </a>
+      <a class="drawer-item" data-view="birthdays" onclick="showView('birthdays')">
+        <i class="fas fa-birthday-cake"></i><span>اعياد الميلاد</span>
+      </a>
+      <a class="drawer-item" data-view="visits" onclick="showView('visits')">
+        <i class="fas fa-hand-holding-heart"></i><span>الافتقادات</span>
+      </a>
+      <div class="drawer-divider"></div>
+      <a class="drawer-item" data-view="settings" onclick="showView('settings')">
+        <i class="fas fa-cog"></i><span>الإعدادات</span>
+      </a>
+    </div>
   </nav>
 
   <!-- DASHBOARD -->
   <section id="view-dashboard" class="view active">
-    <header class="view-header">
-      <div>
-        <h1>✠ خدمة اعدادي</h1>
-        <p id="dashDate" class="subtitle"></p>
-      </div>
-      <div class="header-avatar" id="headerAvatar" onclick="showView('settings')"></div>
-    </header>
     <div class="date-nav">
       <button class="btn btn-icon" onclick="navigateDate(-1)"><i class="fas fa-chevron-right"></i></button>
       <span id="dashDateLabel" class="date-label"></span>
@@ -233,7 +270,43 @@
       <i class="fas fa-search"></i>
       <input type="text" id="employeeSearch" placeholder="بحث عن مخدوم..." oninput="searchEmployees(this.value)" />
     </div>
+    <div class="filter-bar" style="margin-bottom:12px">
+      <button class="filter-btn active" data-class="all" onclick="filterEmployeesByClass('all')">الكل</button>
+      <button class="filter-btn" data-class="اولي" onclick="filterEmployeesByClass('اولي')">اولي</button>
+      <button class="filter-btn" data-class="تانيه" onclick="filterEmployeesByClass('تانيه')">تانيه</button>
+      <button class="filter-btn" data-class="تالته" onclick="filterEmployeesByClass('تالته')">تالته</button>
+    </div>
     <div id="employeeList" class="card-list"></div>
+  </section>
+
+  <!-- BIRTHDAYS -->
+  <section id="view-birthdays" class="view">
+    <header class="view-header">
+      <h1><i class="fas fa-birthday-cake"></i> اعياد الميلاد</h1>
+    </header>
+    <div class="filter-bar" style="margin-bottom:16px">
+      <button class="filter-btn active" data-days="7" onclick="loadBirthdays(7)">7 أيام</button>
+      <button class="filter-btn" data-days="14" onclick="loadBirthdays(14)">14 يوم</button>
+      <button class="filter-btn" data-days="30" onclick="loadBirthdays(30)">30 يوم</button>
+      <button class="filter-btn" data-days="60" onclick="loadBirthdays(60)">60 يوم</button>
+      <button class="filter-btn" data-days="90" onclick="loadBirthdays(90)">90 يوم</button>
+    </div>
+    <div id="birthdaysList" class="card-list">
+      <div class="empty-state"><i class="fas fa-birthday-cake"></i><p>لا توجد أعياد ميلاد قريبة</p></div>
+    </div>
+  </section>
+
+  <!-- VISITS -->
+  <section id="view-visits" class="view">
+    <header class="view-header">
+      <h1><i class="fas fa-hand-holding-heart"></i> الافتقادات</h1>
+      <button class="btn btn-primary btn-sm" onclick="showAddVisitModal()">
+        <i class="fas fa-plus"></i> إضافة
+      </button>
+    </header>
+    <div id="visitsList" class="card-list">
+      <div class="empty-state"><i class="fas fa-hand-holding-heart"></i><p>لا توجد افتقادات</p></div>
+    </div>
   </section>
 
   <!-- PROFILE -->
@@ -250,9 +323,28 @@
   <section id="view-supervisors" class="view">
     <header class="view-header">
       <button class="btn btn-icon" onclick="showView('settings')"><i class="fas fa-arrow-right"></i></button>
-      <h1><i class="fas fa-users-cog"></i> إدارة المشرفين</h1>
+      <h1><i class="fas fa-users-cog"></i> إدارة الخدام</h1>
     </header>
     <div id="supervisorsList" class="card-list"></div>
+  </section>
+
+  <!-- SUPERVISOR PROFILE -->
+  <section id="view-supervisor-profile" class="view">
+    <header class="view-header">
+      <button class="btn btn-icon" onclick="goBack()"><i class="fas fa-arrow-right"></i></button>
+      <h1>ملف الخادم</h1>
+      <button class="btn btn-icon" id="editSupervisorBtn" onclick="toggleEditSupervisor()" style="display:none"><i class="fas fa-pen"></i></button>
+    </header>
+    <div id="supervisorProfileContent" class="profile-content"></div>
+  </section>
+
+  <!-- SERVICES MANAGEMENT (master admin only) -->
+  <section id="view-services" class="view">
+    <header class="view-header">
+      <button class="btn btn-icon" onclick="showView('settings')"><i class="fas fa-arrow-right"></i></button>
+      <h1><i class="fas fa-server"></i> إدارة الخدمات والمراحل</h1>
+    </header>
+    <div id="servicesContent"></div>
   </section>
 
   <!-- SETTINGS -->
@@ -263,13 +355,18 @@
     <div class="settings-content">
       <div class="settings-profile">
         <div class="settings-avatar" id="settingsAvatar"></div>
-        <h2 id="settingsName">المشرف</h2>
+        <h2 id="settingsName">الخادم</h2>
         <p id="settingsPhone">01xxxxxxxxx</p>
       </div>
       <div class="settings-group">
         <div class="settings-item" onclick="showView('supervisors')">
           <i class="fas fa-users-cog"></i>
-          <span>إدارة المشرفين</span>
+          <span>إدارة الخدام</span>
+          <i class="fas fa-chevron-left"></i>
+        </div>
+        <div class="settings-item" id="settingsServicesItem" style="display:none" onclick="showView('services')">
+          <i class="fas fa-server"></i>
+          <span>إدارة الخدمات والمراحل</span>
           <i class="fas fa-chevron-left"></i>
         </div>
         <div class="settings-item" onclick="exportAttendance()">
@@ -277,6 +374,8 @@
           <span>تصدير التقرير</span>
           <i class="fas fa-chevron-left"></i>
         </div>
+      </div>
+      
       </div>
       <button class="btn btn-danger btn-full" onclick="handleLogout()" style="margin-top:24px">
         <i class="fas fa-sign-out-alt"></i> تسجيل الخروج
@@ -305,7 +404,12 @@
       </div>
       <div class="form-group">
         <label>الفصل</label>
-        <input type="text" id="empClass" placeholder="الفصل" />
+        <select id="empClass">
+          <option value="">-- اختر الفصل --</option>
+          <option value="اولي">اولي</option>
+          <option value="تانيه">تانيه</option>
+          <option value="تالته">تالته</option>
+        </select>
       </div>
       <div class="form-group">
         <label>تاريخ الميلاد</label>
@@ -335,6 +439,83 @@
   </div>
 </div>
 
+<!-- VISIT MODAL -->
+<div id="visitModal" class="modal hidden">
+  <div class="modal-backdrop" onclick="closeVisitModal()"></div>
+  <div class="modal-content">
+    <div class="modal-header">
+      <h2>إضافة افتقاد</h2>
+      <button class="btn btn-icon" onclick="closeVisitModal()"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label><i class="fas fa-user"></i> المخدوم *</label>
+        <select id="visitEmployee">
+          <option value="">-- اختر المخدوم --</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label><i class="fas fa-calendar"></i> تاريخ الافتقاد</label>
+        <input type="date" id="visitDate" />
+      </div>
+      <div class="form-group">
+        <label><i class="fas fa-sticky-note"></i> ملاحظات</label>
+        <textarea id="visitNotes" placeholder="ملاحظات (اختياري)" rows="3"></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeVisitModal()">إلغاء</button>
+      <button class="btn btn-primary" onclick="saveVisit()"><i class="fas fa-save"></i> حفظ</button>
+    </div>
+  </div>
+</div>
+
+<!-- SUPERVISOR EDIT MODAL -->
+<div id="supervisorEditModal" class="modal hidden">
+  <div class="modal-backdrop" onclick="closeSupervisorModal()"></div>
+  <div class="modal-content">
+    <div class="modal-header">
+      <h2>تعديل بيانات الخادم</h2>
+      <button class="btn btn-icon" onclick="closeSupervisorModal()"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>الاسم الكامل *</label>
+        <input type="text" id="supEditName" placeholder="اسم الخادم" />
+      </div>
+      <div class="form-group">
+        <label>رقم الهاتف *</label>
+        <input type="tel" id="supEditPhone" placeholder="رقم الهاتف" />
+      </div>
+      <div class="form-group">
+        <label>كلمة المرور الجديدة (اختياري)</label>
+        <input type="password" id="supEditPassword" placeholder="اتركه فارغاً إن لم ترغب بتغييره" />
+      </div>
+      <div class="form-group" style="display:none" id="supEditServiceGroup">
+        <label>الخدمة</label>
+        <select id="supEditService" onchange="onSupEditServiceChange()"></select>
+      </div>
+      <div class="form-group" style="display:none" id="supEditStageGroup">
+        <label>المرحلة</label>
+        <select id="supEditStage"></select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeSupervisorModal()">إلغاء</button>
+      <button class="btn btn-primary" id="supModalSaveBtn"><i class="fas fa-save"></i> حفظ</button>
+    </div>
+  </div>
+</div>
+
 <script src="js/app.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js')
+        .then(reg => console.log('Service Worker registered', reg))
+        .catch(err => console.error('Service Worker registration failed:', err));
+    });
+  }
+</script>
 </body>
 </html>

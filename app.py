@@ -1,11 +1,14 @@
-"""
+﻿"""
 NFC Attendance System - Backend
 Excel-based database + pywebview standalone window
+Supports multiple services (خدمات) and stages (مراحل) under Sunday School.
+Master admin = the desktop (pywebview) session.
 """
 
 from flask import Flask, jsonify, request, send_from_directory, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
+from flask_cors import CORS
 from openpyxl import Workbook, load_workbook
 import threading
 import os
@@ -17,6 +20,8 @@ from urllib import parse, request as urlrequest, error as urlerror
 from datetime import datetime, date, timedelta
 
 app = Flask(__name__)
+CORS(app)
+app.permanent_session_lifetime = timedelta(days=365)
 app.secret_key = os.environ.get('SECRET_KEY', 'nfc-attendance-secret-key-change-in-production')
 
 # When running as a PyInstaller .exe, use the exe's directory for runtime files
@@ -36,27 +41,158 @@ OTP_STORE = {}
 OTP_TTL_MINUTES = int(os.environ.get('OTP_TTL_MINUTES', '5'))
 OTP_MAX_ATTEMPTS = int(os.environ.get('OTP_MAX_ATTEMPTS', '5'))
 
+# Master admin secret — sent as a special header from pywebview
+MASTER_ADMIN_SECRET = os.environ.get('MASTER_ADMIN_SECRET', 'pywebview-master-admin-2024')
+
+# Master admin phone number — this supervisor gets admin privileges on login
+MASTER_ADMIN_PHONE = '01274767185'
+MASTER_ADMIN_PASSWORD = '1234'
+
+
+# ===== UTILITY FUNCTIONS (must be defined before _init_excel) =====
+
+def normalize_phone(phone):
+    """Keep only digits to normalize phone numbers before comparison/storage."""
+    return ''.join(ch for ch in str(phone) if ch.isdigit())
+
+
+def is_valid_phone(phone):
+    """Validate Egyptian mobile numbers (11 digits starting with 01)."""
+    return bool(re.fullmatch(r"01\d{9}", phone))
+
+
+def to_e164_eg(phone):
+    """Convert local Egyptian mobile number to E.164 format for SMS providers."""
+    normalized = normalize_phone(phone)
+    if normalized.startswith('01') and len(normalized) == 11:
+        return '+2' + normalized
+    return normalized
+
 
 # ===== EXCEL DATABASE LAYER =====
 
 def _init_excel():
     """Create the Excel file with proper sheets and headers if it doesn't exist."""
     if os.path.exists(EXCEL_PATH):
+        # Migrate: ensure new sheets exist in older files
+        _migrate_excel()
         return
     wb = Workbook()
-    # Supervisors sheet
-    ws_sup = wb.active
-    ws_sup.title = 'Supervisors'
-    ws_sup.append(['id', 'name', 'phone', 'password_hash', 'created_at'])
-    # Employees sheet
+    # Services sheet
+    ws_svc = wb.active
+    ws_svc.title = 'Services'
+    ws_svc.append(['id', 'name', 'created_at'])
+    # Seed default service: مدارس الاحد
+    ws_svc.append([1, 'مدارس الاحد', datetime.now().isoformat()])
+
+    # Stages sheet
+    ws_stg = wb.create_sheet('Stages')
+    ws_stg.append(['id', 'service_id', 'name', 'created_at'])
+    # Seed default stages for مدارس الاحد (service_id=1)
+    default_stages = ['ملائكة', 'اولي وتانية', 'رابعة وخامسة وسادسة', 'اعدادي', 'ثانوي']
+    for i, stage_name in enumerate(default_stages, start=1):
+        ws_stg.append([i, 1, stage_name, datetime.now().isoformat()])
+
+    # Supervisors sheet (now with service_id and stage_id)
+    ws_sup = wb.create_sheet('Supervisors')
+    ws_sup.append(['id', 'name', 'phone', 'password_hash', 'service_id', 'stage_id', 'created_at'])
+    # Seed master admin supervisor
+    ws_sup.append([1, 'المدير العام', MASTER_ADMIN_PHONE,
+                   generate_password_hash(MASTER_ADMIN_PASSWORD), 0, 0,
+                   datetime.now().isoformat()])
+
+    # Employees sheet (now with service_id and stage_id)
     ws_emp = wb.create_sheet('Employees')
     ws_emp.append(['id', 'nfc_uid', 'name', 'birthdate', 'address', 'phone',
                    'email', 'department', 'parent_phone', 'confession_father',
-                   'photo_url', 'created_at'])
+                   'photo_url', 'service_id', 'stage_id', 'created_at'])
+
     # Attendance sheet
     ws_att = wb.create_sheet('Attendance')
     ws_att.append(['id', 'employee_id', 'supervisor_id', 'scan_time', 'status', 'notes'])
+
+    # Visits (افتقادات) sheet
+    ws_vis = wb.create_sheet('Visits')
+    ws_vis.append(['id', 'employee_id', 'supervisor_id', 'visit_date', 'notes', 'created_at'])
+
     wb.save(EXCEL_PATH)
+
+
+def _migrate_excel():
+    """Add missing sheets/columns to an existing Excel file for backward compatibility."""
+    with _excel_lock:
+        wb = _load_wb()
+        changed = False
+
+        # Ensure Services sheet exists
+        if 'Services' not in wb.sheetnames:
+            ws_svc = wb.create_sheet('Services')
+            ws_svc.append(['id', 'name', 'created_at'])
+            ws_svc.append([1, 'مدارس الاحد', datetime.now().isoformat()])
+            changed = True
+
+        # Ensure Stages sheet exists
+        if 'Stages' not in wb.sheetnames:
+            ws_stg = wb.create_sheet('Stages')
+            ws_stg.append(['id', 'service_id', 'name', 'created_at'])
+            default_stages = ['ملائكة', 'اولي وتانية', 'رابعة وخامسة وسادسة', 'اعدادي', 'ثانوي']
+            for i, stage_name in enumerate(default_stages, start=1):
+                ws_stg.append([i, 1, stage_name, datetime.now().isoformat()])
+            changed = True
+
+        # Ensure Visits sheet exists
+        if 'Visits' not in wb.sheetnames:
+            ws_vis = wb.create_sheet('Visits')
+            ws_vis.append(['id', 'employee_id', 'supervisor_id', 'visit_date', 'notes', 'created_at'])
+            changed = True
+
+        # Add service_id, stage_id columns to Supervisors if missing
+        if 'Supervisors' in wb.sheetnames:
+            ws_sup = wb['Supervisors']
+            headers = _get_headers(ws_sup)
+            if 'service_id' not in headers:
+                col = len(headers) + 1
+                ws_sup.cell(row=1, column=col, value='service_id')
+                changed = True
+            if 'stage_id' not in headers:
+                col = len(_get_headers(ws_sup)) + 1
+                ws_sup.cell(row=1, column=col, value='stage_id')
+                changed = True
+
+        # Add service_id, stage_id columns to Employees if missing
+        if 'Employees' in wb.sheetnames:
+            ws_emp = wb['Employees']
+            headers = _get_headers(ws_emp)
+            if 'service_id' not in headers:
+                col = len(headers) + 1
+                ws_emp.cell(row=1, column=col, value='service_id')
+                changed = True
+            if 'stage_id' not in headers:
+                col = len(_get_headers(ws_emp)) + 1
+                ws_emp.cell(row=1, column=col, value='stage_id')
+                changed = True
+
+        # Ensure master admin supervisor exists
+        if 'Supervisors' in wb.sheetnames:
+            ws_sup = wb['Supervisors']
+            sup_headers = _get_headers(ws_sup)
+            phone_col = sup_headers.index('phone') + 1
+            admin_exists = False
+            for row_num in range(2, ws_sup.max_row + 1):
+                val = ws_sup.cell(row=row_num, column=phone_col).value
+                if val is not None and normalize_phone(str(val)) == MASTER_ADMIN_PHONE:
+                    admin_exists = True
+                    break
+            if not admin_exists:
+                new_id = _next_id(ws_sup)
+                ws_sup.append([new_id, 'المدير العام', MASTER_ADMIN_PHONE,
+                               generate_password_hash(MASTER_ADMIN_PASSWORD),
+                               0, 0, datetime.now().isoformat()])
+                changed = True
+
+        if changed:
+            wb.save(EXCEL_PATH)
+        wb.close()
 
 
 def _load_wb():
@@ -115,6 +251,16 @@ def _row_to_dict(ws, row_num):
     return d
 
 
+def _safe_int(val, default=0):
+    """Safely convert a value to int."""
+    if val is None or val == '':
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
 # ===== INIT =====
 _init_excel()
 
@@ -122,10 +268,30 @@ _init_excel()
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if 'supervisor_id' not in session:
+        if 'supervisor_id' not in session and not _is_master_admin():
             return jsonify({'error': 'Authentication required'}), 401
         return f(*args, **kwargs)
     return decorated
+
+
+def master_admin_required(f):
+    """Only the desktop (pywebview) master admin can call these endpoints."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not _is_master_admin():
+            return jsonify({'error': 'Master admin access required'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+def _is_master_admin():
+    """Check if the current request is from the master admin (pywebview desktop)."""
+    # Method 1: special header
+    secret = request.headers.get('X-Master-Admin-Secret', '')
+    if secret == MASTER_ADMIN_SECRET:
+        return True
+    # Method 2: session flag set by /api/admin/login
+    return session.get('is_master_admin', False)
 
 
 def get_nearest_friday(d=None):
@@ -135,22 +301,9 @@ def get_nearest_friday(d=None):
     return d - timedelta(days=days_since_friday)
 
 
-def normalize_phone(phone):
-    """Keep only digits to normalize phone numbers before comparison/storage."""
-    return ''.join(ch for ch in str(phone) if ch.isdigit())
 
 
-def is_valid_phone(phone):
-    """Validate Egyptian mobile numbers (11 digits starting with 01)."""
-    return bool(re.fullmatch(r"01\d{9}", phone))
 
-
-def to_e164_eg(phone):
-    """Convert local Egyptian mobile number to E.164 format for SMS providers."""
-    normalized = normalize_phone(phone)
-    if normalized.startswith('01') and len(normalized) == 11:
-        return '+2' + normalized
-    return normalized
 
 
 def generate_otp_code():
@@ -206,6 +359,30 @@ def send_sms_otp(phone, otp_code):
         return {'sent': False, 'simulated': False, 'error': str(exc)}
 
 
+def _get_next_birthday(birthdate_str):
+    """Given a birthdate string (YYYY-MM-DD), return the next birthday as ISO string."""
+    if not birthdate_str or birthdate_str == '':
+        return ''
+    try:
+        bd = datetime.strptime(str(birthdate_str).strip()[:10], '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return ''
+    today = date.today()
+    this_year_bd = bd.replace(year=today.year)
+    if this_year_bd < today:
+        this_year_bd = bd.replace(year=today.year + 1)
+    return this_year_bd.isoformat()
+
+
+def _get_last_visit_date(employee_id, visits):
+    """Get the most recent visit date for an employee from visits list."""
+    emp_visits = [v for v in visits if _safe_int(v.get('employee_id')) == employee_id]
+    if not emp_visits:
+        return ''
+    emp_visits.sort(key=lambda v: str(v.get('visit_date', '')), reverse=True)
+    return str(emp_visits[0].get('visit_date', ''))
+
+
 # ===== STATIC FILE SERVING =====
 
 @app.route('/')
@@ -229,6 +406,161 @@ def serve_sw():
     return send_from_directory(BASE_DIR, 'sw.js')
 
 
+# ===== MASTER ADMIN ENDPOINTS =====
+
+@app.route('/api/admin/login', methods=['POST'])
+def admin_login():
+    """Login as master admin using a secret key (from pywebview desktop)."""
+    data = request.json or {}
+    secret = data.get('secret', '')
+    if secret == MASTER_ADMIN_SECRET:
+        session['is_master_admin'] = True
+        session['supervisor_id'] = -1  # special admin ID
+        return jsonify({'message': 'OK', 'is_master_admin': True})
+    return jsonify({'error': 'Invalid admin secret'}), 401
+
+
+@app.route('/api/admin/check', methods=['GET'])
+@app.route('/api/ping', methods=['GET'])
+def ping():
+    return jsonify({'nfc_server': True, 'message': 'pong'})
+
+def admin_check():
+    """Check if current session is master admin."""
+    return jsonify({'is_master_admin': _is_master_admin()})
+
+
+# ===== SERVICES ENDPOINTS (master admin only for create/delete) =====
+
+@app.route('/api/services', methods=['GET'])
+def list_services():
+    """List all services. No auth required so registration page can show them."""
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Services']
+        services = _sheet_to_dicts(ws)
+        wb.close()
+    result = []
+    for s in services:
+        result.append({
+            'id': _safe_int(s['id']),
+            'name': s['name'],
+            'created_at': s.get('created_at', ''),
+        })
+    result.sort(key=lambda x: x['name'])
+    return jsonify(result)
+
+
+@app.route('/api/services', methods=['POST'])
+@master_admin_required
+def create_service():
+    data = request.json
+    name = data.get('name', '').strip()
+    if not name:
+        return jsonify({'error': 'Service name required'}), 400
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Services']
+        # Check uniqueness
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row[0] is not None and str(row[1]).strip() == name:
+                wb.close()
+                return jsonify({'error': 'Service already exists'}), 409
+        new_id = _next_id(ws)
+        ws.append([new_id, name, datetime.now().isoformat()])
+        wb.save(EXCEL_PATH)
+        wb.close()
+    return jsonify({'message': 'OK', 'service': {'id': new_id, 'name': name}}), 201
+
+
+@app.route('/api/services/<int:svc_id>', methods=['DELETE'])
+@master_admin_required
+def delete_service(svc_id):
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Services']
+        row = _find_row_by_id(ws, svc_id)
+        if row:
+            ws.delete_rows(row)
+        # Also delete all stages of this service
+        ws_stg = wb['Stages']
+        rows_to_delete = []
+        headers = _get_headers(ws_stg)
+        svc_col = headers.index('service_id') + 1
+        for r in range(2, ws_stg.max_row + 1):
+            val = ws_stg.cell(row=r, column=svc_col).value
+            if val is not None and _safe_int(val) == svc_id:
+                rows_to_delete.append(r)
+        for r in reversed(rows_to_delete):
+            ws_stg.delete_rows(r)
+        wb.save(EXCEL_PATH)
+        wb.close()
+    return jsonify({'message': 'OK'})
+
+
+# ===== STAGES ENDPOINTS (master admin only for create/delete) =====
+
+@app.route('/api/stages', methods=['GET'])
+def list_stages():
+    """List all stages, optionally filtered by service_id. No auth required for registration."""
+    service_id = request.args.get('service_id')
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Stages']
+        stages = _sheet_to_dicts(ws)
+        wb.close()
+    result = []
+    for s in stages:
+        if service_id and _safe_int(s.get('service_id')) != _safe_int(service_id):
+            continue
+        result.append({
+            'id': _safe_int(s['id']),
+            'service_id': _safe_int(s.get('service_id')),
+            'name': s['name'],
+            'created_at': s.get('created_at', ''),
+        })
+    result.sort(key=lambda x: x['name'])
+    return jsonify(result)
+
+
+@app.route('/api/stages', methods=['POST'])
+@master_admin_required
+def create_stage():
+    data = request.json
+    name = data.get('name', '').strip()
+    service_id = _safe_int(data.get('service_id'))
+    if not name or not service_id:
+        return jsonify({'error': 'Stage name and service_id required'}), 400
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Stages']
+        # Check uniqueness within service
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if (row[0] is not None and _safe_int(row[1]) == service_id
+                    and str(row[2]).strip() == name):
+                wb.close()
+                return jsonify({'error': 'Stage already exists in this service'}), 409
+        new_id = _next_id(ws)
+        ws.append([new_id, service_id, name, datetime.now().isoformat()])
+        wb.save(EXCEL_PATH)
+        wb.close()
+    return jsonify({'message': 'OK', 'stage': {'id': new_id, 'service_id': service_id, 'name': name}}), 201
+
+
+@app.route('/api/stages/<int:stage_id>', methods=['DELETE'])
+@master_admin_required
+def delete_stage(stage_id):
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Stages']
+        row = _find_row_by_id(ws, stage_id)
+        if row:
+            ws.delete_rows(row)
+        wb.save(EXCEL_PATH)
+        wb.close()
+    return jsonify({'message': 'OK'})
+
+
 # ===== AUTH ENDPOINTS =====
 
 @app.route('/api/auth/register', methods=['POST'])
@@ -237,27 +569,38 @@ def register():
     name = data.get('name', '').strip()
     phone = normalize_phone(data.get('phone', '').strip())
     password = data.get('password', '')
+    service_id = _safe_int(data.get('service_id'))
+    stage_id = _safe_int(data.get('stage_id'))
     if not name or not phone or not password:
         return jsonify({'error': 'All fields required'}), 400
     if not is_valid_phone(phone):
         return jsonify({'error': 'Invalid phone number. Use 11 digits starting with 01'}), 400
     if len(password) < 4:
         return jsonify({'error': 'Password must be at least 4 characters'}), 400
+    if not service_id or not stage_id:
+        return jsonify({'error': 'Service and stage are required'}), 400
     with _excel_lock:
         wb = _load_wb()
         ws = wb['Supervisors']
         # Check uniqueness
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if row[0] is not None and normalize_phone(row[2]) == phone:
+        headers = _get_headers(ws)
+        phone_col = headers.index('phone') + 1
+        for row_num in range(2, ws.max_row + 1):
+            val = ws.cell(row=row_num, column=phone_col).value
+            if val is not None and normalize_phone(val) == phone:
                 wb.close()
                 return jsonify({'error': 'Phone already registered'}), 409
         new_id = _next_id(ws)
         ws.append([new_id, name, phone, generate_password_hash(password),
-                   datetime.now().isoformat()])
+                   service_id, stage_id, datetime.now().isoformat()])
         wb.save(EXCEL_PATH)
         wb.close()
+    session.permanent = True
     session['supervisor_id'] = new_id
-    return jsonify({'message': 'OK', 'supervisor': {'id': new_id, 'name': name, 'phone': phone}}), 201
+    return jsonify({'message': 'OK', 'supervisor': {
+        'id': new_id, 'name': name, 'phone': phone,
+        'service_id': service_id, 'stage_id': stage_id
+    }}), 201
 
 
 @app.route('/api/auth/login', methods=['POST'])
@@ -279,10 +622,21 @@ def login():
             break
     if not supervisor or not check_password_hash(supervisor['password_hash'], password):
         return jsonify({'error': 'Invalid credentials'}), 401
+    session.permanent = True
     session['supervisor_id'] = int(supervisor['id'])
+    # Grant master admin if this is the admin phone
+    is_admin = (phone == MASTER_ADMIN_PHONE)
+    if is_admin:
+        session['is_master_admin'] = True
     return jsonify({
         'message': 'OK',
-        'supervisor': {'id': int(supervisor['id']), 'name': supervisor['name'], 'phone': supervisor['phone']}
+        'is_master_admin': is_admin,
+        'supervisor': {
+            'id': int(supervisor['id']), 'name': supervisor['name'],
+            'phone': supervisor['phone'],
+            'service_id': _safe_int(supervisor.get('service_id')),
+            'stage_id': _safe_int(supervisor.get('stage_id')),
+        }
     })
 
 
@@ -302,8 +656,10 @@ def forgot_password_request_otp():
         wb = _load_wb()
         ws = wb['Supervisors']
         phone_exists = False
+        headers = _get_headers(ws)
+        phone_col = headers.index('phone') + 1
         for row_num in range(2, ws.max_row + 1):
-            row_phone = normalize_phone(ws.cell(row=row_num, column=3).value)
+            row_phone = normalize_phone(ws.cell(row=row_num, column=phone_col).value)
             if row_phone == phone:
                 phone_exists = True
                 break
@@ -329,7 +685,6 @@ def forgot_password_request_otp():
         'message': f'OTP has been sent. It expires in {OTP_TTL_MINUTES} minutes.'
     }
     if sms_result.get('simulated'):
-        # Dev/testing mode only; real SMS mode never exposes OTP in API response.
         response['simulated'] = True
         response['otp_preview'] = otp_code
 
@@ -368,9 +723,12 @@ def forgot_password_verify_otp():
     with _excel_lock:
         wb = _load_wb()
         ws = wb['Supervisors']
+        headers = _get_headers(ws)
+        phone_col = headers.index('phone') + 1
+        pw_col = headers.index('password_hash') + 1
         target_row = None
         for row_num in range(2, ws.max_row + 1):
-            row_phone = normalize_phone(ws.cell(row=row_num, column=3).value)
+            row_phone = normalize_phone(ws.cell(row=row_num, column=phone_col).value)
             if row_phone == phone:
                 target_row = row_num
                 break
@@ -380,7 +738,7 @@ def forgot_password_verify_otp():
                 OTP_STORE.pop(phone, None)
             return jsonify({'error': 'Phone number not found'}), 404
 
-        ws.cell(row=target_row, column=4, value=generate_password_hash(new_password))
+        ws.cell(row=target_row, column=pw_col, value=generate_password_hash(new_password))
         wb.save(EXCEL_PATH)
         wb.close()
 
@@ -398,6 +756,15 @@ def logout():
 
 @app.route('/api/auth/me', methods=['GET'])
 def auth_me():
+    if _is_master_admin():
+        return jsonify({
+            'authenticated': True,
+            'is_master_admin': True,
+            'supervisor': {
+                'id': -1, 'name': 'المدير العام', 'phone': '',
+                'service_id': 0, 'stage_id': 0,
+            }
+        })
     if 'supervisor_id' not in session:
         return jsonify({'authenticated': False}), 401
     with _excel_lock:
@@ -414,7 +781,10 @@ def auth_me():
         session.clear()
         return jsonify({'authenticated': False}), 401
     return jsonify({'authenticated': True, 'supervisor': {
-        'id': int(supervisor['id']), 'name': supervisor['name'], 'phone': supervisor['phone']
+        'id': int(supervisor['id']), 'name': supervisor['name'],
+        'phone': supervisor['phone'],
+        'service_id': _safe_int(supervisor.get('service_id')),
+        'stage_id': _safe_int(supervisor.get('stage_id')),
     }})
 
 
@@ -428,12 +798,99 @@ def list_supervisors():
         wb.close()
     result = sorted([{
         'id': int(s['id']), 'name': s['name'], 'phone': s['phone'],
+        'service_id': _safe_int(s.get('service_id')),
+        'stage_id': _safe_int(s.get('stage_id')),
         'created_at': s.get('created_at', '')
     } for s in supervisors], key=lambda x: x['name'])
     return jsonify(result)
 
 
-# ===== NFC SCAN =====
+@app.route('/api/supervisors/<int:sup_id>', methods=['GET'])
+@login_required
+def get_supervisor(sup_id):
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Supervisors']
+        row = _find_row_by_id(ws, sup_id)
+        if not row:
+            wb.close()
+            return jsonify({'error': 'Not found'}), 404
+        sup = _row_to_dict(ws, row)
+        
+        # Count stats for this supervisor
+        ws_att = wb['Attendance']
+        attendance = _sheet_to_dicts(ws_att)
+        wb.close()
+        
+    sup_dict = {
+        'id': int(sup['id']), 'name': sup['name'], 'phone': sup['phone'],
+        'service_id': _safe_int(sup.get('service_id')),
+        'stage_id': _safe_int(sup.get('stage_id')),
+        'created_at': sup.get('created_at', '')
+    }
+    
+    total_scans = sum(1 for a in attendance if _safe_int(a.get('supervisor_id')) == sup_id)
+    return jsonify({
+        'supervisor': sup_dict,
+        'stats': {'total_scans': total_scans}
+    })
+
+@app.route('/api/supervisors/<int:sup_id>', methods=['PUT'])
+@master_admin_required
+def update_supervisor(sup_id):
+    data = request.json
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Supervisors']
+        row_num = _find_row_by_id(ws, sup_id)
+        if not row_num:
+            wb.close()
+            return jsonify({'error': 'Not found'}), 404
+        
+        headers = _get_headers(ws)
+        old = _row_to_dict(ws, row_num)
+        
+        field_map = {
+            'name': data.get('name', old['name']),
+            'phone': normalize_phone(data.get('phone', old['phone'])),
+            'service_id': _safe_int(data.get('service_id', old.get('service_id'))),
+            'stage_id': _safe_int(data.get('stage_id', old.get('stage_id'))),
+        }
+        
+        new_password = data.get('password', '').strip()
+        if new_password:
+            field_map['password_hash'] = generate_password_hash(new_password)
+            
+        for field, value in field_map.items():
+            if field in headers:
+                ws.cell(row=row_num, column=headers.index(field) + 1, value=value)
+                
+        wb.save(EXCEL_PATH)
+        updated = _row_to_dict(ws, row_num)
+        wb.close()
+        
+    return jsonify({'message': 'OK', 'supervisor': {
+        'id': int(updated['id']), 'name': updated['name'], 'phone': updated['phone'],
+        'service_id': _safe_int(updated.get('service_id')),
+        'stage_id': _safe_int(updated.get('stage_id'))
+    }})
+
+@app.route('/api/supervisors/<int:sup_id>', methods=['DELETE'])
+@master_admin_required
+def delete_supervisor(sup_id):
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Supervisors']
+        row = _find_row_by_id(ws, sup_id)
+        if row:
+            ws.delete_rows(row)
+            
+        # Optional: nullify or delete attendance/visits done by this supervisor
+        # we'll skip for now to preserve history, or we could just set supervisor_id to null
+        
+        wb.save(EXCEL_PATH)
+        wb.close()
+    return jsonify({'message': 'OK'})
 
 @app.route('/api/nfc/scan', methods=['POST'])
 @login_required
@@ -478,7 +935,8 @@ def nfc_scan():
         now_time = datetime.now().strftime('%H:%M:%S')
         record_time = scan_date + ' ' + now_time
         new_id = _next_id(ws_att)
-        ws_att.append([new_id, int(employee['id']), session['supervisor_id'], record_time, 'present', ''])
+        sup_id = session.get('supervisor_id', -1)
+        ws_att.append([new_id, int(employee['id']), sup_id, record_time, 'present', ''])
         wb.save(EXCEL_PATH)
         wb.close()
     emp_dict = {k: (int(v) if k == 'id' else v) for k, v in employee.items()}
@@ -513,16 +971,17 @@ def manual_attendance():
                 break
         now_time = datetime.now().strftime('%H:%M:%S')
         record_time = record_date + ' ' + now_time
+        sup_id = session.get('supervisor_id', -1)
         if existing:
             row_num = _find_row_by_id(ws_att, existing['id'])
             if row_num:
                 headers = _get_headers(ws_att)
                 ws_att.cell(row=row_num, column=headers.index('status') + 1, value=status)
                 ws_att.cell(row=row_num, column=headers.index('notes') + 1, value=notes)
-                ws_att.cell(row=row_num, column=headers.index('supervisor_id') + 1, value=session['supervisor_id'])
+                ws_att.cell(row=row_num, column=headers.index('supervisor_id') + 1, value=sup_id)
         else:
             new_id = _next_id(ws_att)
-            ws_att.append([new_id, employee_id, session['supervisor_id'], record_time, status, notes])
+            ws_att.append([new_id, employee_id, sup_id, record_time, status, notes])
         wb.save(EXCEL_PATH)
         wb.close()
     return jsonify({'message': 'OK', 'status': status})
@@ -533,15 +992,25 @@ def manual_attendance():
 @app.route('/api/employees', methods=['GET'])
 @login_required
 def list_employees():
+    service_id = request.args.get('service_id')
+    stage_id = request.args.get('stage_id')
     with _excel_lock:
         wb = _load_wb()
         ws = wb['Employees']
         employees = _sheet_to_dicts(ws)
         wb.close()
+    result = []
     for e in employees:
         e['id'] = int(e['id'])
-    employees.sort(key=lambda x: x['name'])
-    return jsonify(employees)
+        e['service_id'] = _safe_int(e.get('service_id'))
+        e['stage_id'] = _safe_int(e.get('stage_id'))
+        if service_id and e['service_id'] != _safe_int(service_id):
+            continue
+        if stage_id and e['stage_id'] != _safe_int(stage_id):
+            continue
+        result.append(e)
+    result.sort(key=lambda x: x['name'])
+    return jsonify(result)
 
 
 @app.route('/api/employees', methods=['POST'])
@@ -552,6 +1021,8 @@ def create_employee():
     name = data.get('name', '').strip()
     if not nfc_uid or not name:
         return jsonify({'error': 'NFC UID and name required'}), 400
+    service_id = _safe_int(data.get('service_id'))
+    stage_id = _safe_int(data.get('stage_id'))
     with _excel_lock:
         wb = _load_wb()
         ws = wb['Employees']
@@ -565,7 +1036,7 @@ def create_employee():
                    data.get('address', ''), data.get('phone', ''),
                    data.get('email', ''), data.get('class_name', ''),
                    data.get('parent_phone', ''), data.get('confession_father', ''),
-                   '', datetime.now().isoformat()])
+                   '', service_id, stage_id, datetime.now().isoformat()])
         wb.save(EXCEL_PATH)
         # Read back the employee
         employee = _row_to_dict(ws, ws.max_row)
@@ -586,11 +1057,17 @@ def get_employee(emp_id):
             return jsonify({'error': 'Not found'}), 404
         employee = _row_to_dict(ws_emp, row_num)
         employee['id'] = int(employee['id'])
+        employee['service_id'] = _safe_int(employee.get('service_id'))
+        employee['stage_id'] = _safe_int(employee.get('stage_id'))
         # Get attendance records
         ws_att = wb['Attendance']
         all_att = _sheet_to_dicts(ws_att)
         ws_sup = wb['Supervisors']
         all_sup = _sheet_to_dicts(ws_sup)
+        # Get visits
+        visits = []
+        if 'Visits' in wb.sheetnames:
+            visits = _sheet_to_dicts(wb['Visits'])
         wb.close()
     sup_map = {int(s['id']): s['name'] for s in all_sup}
     attendance = []
@@ -599,8 +1076,8 @@ def get_employee(emp_id):
             rec = dict(a)
             rec['id'] = int(rec['id'])
             rec['employee_id'] = int(rec['employee_id'])
-            rec['supervisor_id'] = int(rec['supervisor_id'])
-            rec['supervisor_name'] = sup_map.get(int(a['supervisor_id']), '')
+            rec['supervisor_id'] = _safe_int(rec['supervisor_id'])
+            rec['supervisor_name'] = sup_map.get(_safe_int(a['supervisor_id']), '')
             attendance.append(rec)
     attendance.sort(key=lambda x: str(x['scan_time']), reverse=True)
     total_records = len(attendance)
@@ -622,6 +1099,11 @@ def get_employee(emp_id):
             'date': friday.isoformat(),
             'status': record['status'] if record else 'absent'
         })
+
+    # Compute next birthday and last visit
+    next_birthday = _get_next_birthday(employee.get('birthdate', ''))
+    last_visit = _get_last_visit_date(emp_id, visits)
+
     return jsonify({
         'employee': employee,
         'attendance': attendance,
@@ -629,7 +1111,9 @@ def get_employee(emp_id):
             'total_records': total_records, 'present': present_count, 'absent': absent_count,
             'rate': round((present_count / total_records * 100) if total_records > 0 else 0, 1)
         },
-        'weekly': weekly
+        'weekly': weekly,
+        'next_birthday': next_birthday,
+        'last_visit': last_visit,
     })
 
 
@@ -654,6 +1138,8 @@ def update_employee(emp_id):
             'parent_phone': data.get('parent_phone', old['parent_phone']),
             'confession_father': data.get('confession_father', old['confession_father']),
             'department': data.get('class_name', old['department']),
+            'service_id': _safe_int(data.get('service_id', old.get('service_id'))),
+            'stage_id': _safe_int(data.get('stage_id', old.get('stage_id'))),
         }
         for field, value in field_map.items():
             if field in headers:
@@ -679,6 +1165,18 @@ def delete_employee(emp_id):
                 rows_to_delete.append(row_num)
         for row_num in reversed(rows_to_delete):
             ws_att.delete_rows(row_num)
+        # Delete visits
+        if 'Visits' in wb.sheetnames:
+            ws_vis = wb['Visits']
+            vis_headers = _get_headers(ws_vis)
+            emp_col = vis_headers.index('employee_id') + 1
+            rows_to_delete = []
+            for row_num in range(2, ws_vis.max_row + 1):
+                val = ws_vis.cell(row=row_num, column=emp_col).value
+                if val is not None and _safe_int(val) == emp_id:
+                    rows_to_delete.append(row_num)
+            for row_num in reversed(rows_to_delete):
+                ws_vis.delete_rows(row_num)
         # Delete employee
         ws_emp = wb['Employees']
         emp_row = _find_row_by_id(ws_emp, emp_id)
@@ -689,23 +1187,164 @@ def delete_employee(emp_id):
     return jsonify({'message': 'OK'})
 
 
+# ===== VISITS (افتقادات) ENDPOINTS =====
+
+@app.route('/api/visits', methods=['GET'])
+@login_required
+def list_visits():
+    """List visits, optionally filtered by employee_id, service_id, stage_id."""
+    employee_id = request.args.get('employee_id')
+    service_id = request.args.get('service_id')
+    stage_id = request.args.get('stage_id')
+    with _excel_lock:
+        wb = _load_wb()
+        visits = _sheet_to_dicts(wb['Visits']) if 'Visits' in wb.sheetnames else []
+        employees = _sheet_to_dicts(wb['Employees'])
+        supervisors = _sheet_to_dicts(wb['Supervisors'])
+        wb.close()
+    emp_map = {_safe_int(e['id']): e for e in employees}
+    sup_map = {_safe_int(s['id']): s['name'] for s in supervisors}
+
+    result = []
+    for v in visits:
+        eid = _safe_int(v.get('employee_id'))
+        if employee_id and eid != _safe_int(employee_id):
+            continue
+        emp = emp_map.get(eid, {})
+        if service_id and _safe_int(emp.get('service_id')) != _safe_int(service_id):
+            continue
+        if stage_id and _safe_int(emp.get('stage_id')) != _safe_int(stage_id):
+            continue
+        result.append({
+            'id': _safe_int(v['id']),
+            'employee_id': eid,
+            'employee_name': emp.get('name', ''),
+            'supervisor_id': _safe_int(v.get('supervisor_id')),
+            'supervisor_name': sup_map.get(_safe_int(v.get('supervisor_id')), ''),
+            'visit_date': v.get('visit_date', ''),
+            'notes': v.get('notes', ''),
+            'created_at': v.get('created_at', ''),
+        })
+    result.sort(key=lambda x: str(x.get('visit_date', '')), reverse=True)
+    return jsonify(result)
+
+
+@app.route('/api/visits', methods=['POST'])
+@login_required
+def create_visit():
+    data = request.json
+    employee_id = _safe_int(data.get('employee_id'))
+    visit_date = data.get('visit_date', date.today().isoformat())
+    notes = data.get('notes', '')
+    if not employee_id:
+        return jsonify({'error': 'Employee ID required'}), 400
+    sup_id = session.get('supervisor_id', -1)
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Visits']
+        new_id = _next_id(ws)
+        ws.append([new_id, employee_id, sup_id, visit_date, notes, datetime.now().isoformat()])
+        wb.save(EXCEL_PATH)
+        wb.close()
+    return jsonify({
+        'message': 'OK',
+        'visit': {
+            'id': new_id, 'employee_id': employee_id,
+            'supervisor_id': sup_id, 'visit_date': visit_date, 'notes': notes
+        }
+    }), 201
+
+
+@app.route('/api/visits/<int:visit_id>', methods=['DELETE'])
+@login_required
+def delete_visit(visit_id):
+    with _excel_lock:
+        wb = _load_wb()
+        ws = wb['Visits']
+        row = _find_row_by_id(ws, visit_id)
+        if row:
+            ws.delete_rows(row)
+        wb.save(EXCEL_PATH)
+        wb.close()
+    return jsonify({'message': 'OK'})
+
+
+# ===== BIRTHDAYS ENDPOINT =====
+
+@app.route('/api/birthdays', methods=['GET'])
+@login_required
+def upcoming_birthdays():
+    """Return employees with birthdays in the next N days (default 30)."""
+    days_ahead = int(request.args.get('days', 30))
+    service_id = request.args.get('service_id')
+    stage_id = request.args.get('stage_id')
+    with _excel_lock:
+        wb = _load_wb()
+        employees = _sheet_to_dicts(wb['Employees'])
+        wb.close()
+    today = date.today()
+    result = []
+    for emp in employees:
+        if service_id and _safe_int(emp.get('service_id')) != _safe_int(service_id):
+            continue
+        if stage_id and _safe_int(emp.get('stage_id')) != _safe_int(stage_id):
+            continue
+        bd_str = str(emp.get('birthdate', '')).strip()
+        if not bd_str:
+            continue
+        try:
+            bd = datetime.strptime(bd_str[:10], '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            continue
+        this_year_bd = bd.replace(year=today.year)
+        if this_year_bd < today:
+            this_year_bd = bd.replace(year=today.year + 1)
+        days_until = (this_year_bd - today).days
+        if days_until <= days_ahead:
+            age = this_year_bd.year - bd.year
+            result.append({
+                'id': _safe_int(emp['id']),
+                'name': emp['name'],
+                'birthdate': bd_str,
+                'next_birthday': this_year_bd.isoformat(),
+                'days_until': days_until,
+                'age': age,
+                'phone': emp.get('phone', ''),
+                'department': emp.get('department', ''),
+                'service_id': _safe_int(emp.get('service_id')),
+                'stage_id': _safe_int(emp.get('stage_id')),
+            })
+    result.sort(key=lambda x: x['days_until'])
+    return jsonify(result)
+
+
 # ===== DASHBOARD =====
 
 @app.route('/api/dashboard', methods=['GET'])
 @login_required
 def dashboard():
     target_date = request.args.get('date', date.today().isoformat())
+    service_id = request.args.get('service_id')
+    stage_id = request.args.get('stage_id')
     with _excel_lock:
         wb = _load_wb()
         employees = _sheet_to_dicts(wb['Employees'])
         attendance = _sheet_to_dicts(wb['Attendance'])
         supervisors = _sheet_to_dicts(wb['Supervisors'])
         wb.close()
+    # Filter employees by service/stage
+    if service_id:
+        employees = [e for e in employees if _safe_int(e.get('service_id')) == _safe_int(service_id)]
+    if stage_id:
+        employees = [e for e in employees if _safe_int(e.get('stage_id')) == _safe_int(stage_id)]
+    emp_ids = {int(e['id']) for e in employees}
     total_employees = len(employees)
     total_supervisors = len(supervisors)
     day_start = target_date + ' 00:00:00'
     day_end = target_date + ' 23:59:59'
-    day_records = [a for a in attendance if day_start <= str(a['scan_time']) <= day_end]
+    day_records = [a for a in attendance
+                   if day_start <= str(a['scan_time']) <= day_end
+                   and int(a['employee_id']) in emp_ids]
     today_present = sum(1 for a in day_records if a['status'] == 'present')
     today_absent = sum(1 for a in day_records if a['status'] == 'absent')
     emp_map = {int(e['id']): e['name'] for e in employees}
@@ -716,7 +1355,7 @@ def dashboard():
             'employee_id': int(a['employee_id']),
             'employee_name': emp_map.get(int(a['employee_id']), ''),
             'nfc_uid': next((e.get('nfc_uid', '') for e in employees if int(e['id']) == int(a['employee_id'])), ''),
-            'supervisor_name': sup_map.get(int(a['supervisor_id']), ''),
+            'supervisor_name': sup_map.get(_safe_int(a['supervisor_id']), ''),
             'scan_time': a['scan_time'], 'status': a['status']
         })
     return jsonify({
@@ -734,12 +1373,18 @@ def dashboard():
 @login_required
 def attendance_by_date():
     target_date = request.args.get('date', date.today().isoformat())
+    service_id = request.args.get('service_id')
+    stage_id = request.args.get('stage_id')
     with _excel_lock:
         wb = _load_wb()
         employees = _sheet_to_dicts(wb['Employees'])
         attendance = _sheet_to_dicts(wb['Attendance'])
         supervisors = _sheet_to_dicts(wb['Supervisors'])
         wb.close()
+    if service_id:
+        employees = [e for e in employees if _safe_int(e.get('service_id')) == _safe_int(service_id)]
+    if stage_id:
+        employees = [e for e in employees if _safe_int(e.get('stage_id')) == _safe_int(stage_id)]
     day_start = target_date + ' 00:00:00'
     day_end = target_date + ' 23:59:59'
     sup_map = {int(s['id']): s['name'] for s in supervisors}
@@ -757,7 +1402,7 @@ def attendance_by_date():
             'employee': emp_dict,
             'status': record['status'] if record else 'not_scanned',
             'scan_time': record['scan_time'] if record else None,
-            'supervisor': sup_map.get(int(record['supervisor_id']), '') if record else None
+            'supervisor': sup_map.get(_safe_int(record['supervisor_id']), '') if record else None
         })
     return jsonify(result)
 
@@ -789,7 +1434,7 @@ def today_attendance():
             'employee': emp_dict,
             'status': record['status'] if record else 'not_scanned',
             'scan_time': record['scan_time'] if record else None,
-            'supervisor': sup_map.get(int(record['supervisor_id']), '') if record else None
+            'supervisor': sup_map.get(_safe_int(record['supervisor_id']), '') if record else None
         })
     return jsonify(result)
 
@@ -800,11 +1445,19 @@ def today_attendance():
 @login_required
 def analytics():
     weeks = int(request.args.get('weeks', 12))
+    service_id = request.args.get('service_id')
+    stage_id = request.args.get('stage_id')
     with _excel_lock:
         wb = _load_wb()
         employees = _sheet_to_dicts(wb['Employees'])
         attendance = _sheet_to_dicts(wb['Attendance'])
         wb.close()
+    if service_id:
+        employees = [e for e in employees if _safe_int(e.get('service_id')) == _safe_int(service_id)]
+    if stage_id:
+        employees = [e for e in employees if _safe_int(e.get('stage_id')) == _safe_int(stage_id)]
+    emp_ids = {int(e['id']) for e in employees}
+    attendance = [a for a in attendance if int(a['employee_id']) in emp_ids]
     total_employees = len(employees)
     # Weekly attendance trend
     weekly_trend = []
@@ -877,12 +1530,12 @@ def attendance_report():
             emp = emp_map.get(int(a['employee_id']), {})
             records.append({
                 'id': int(a['id']), 'employee_id': int(a['employee_id']),
-                'supervisor_id': int(a['supervisor_id']),
+                'supervisor_id': _safe_int(a['supervisor_id']),
                 'scan_time': a['scan_time'], 'status': a['status'],
                 'notes': a.get('notes', ''),
                 'employee_name': emp.get('name', ''),
                 'nfc_uid': emp.get('nfc_uid', ''),
-                'supervisor_name': sup_map.get(int(a['supervisor_id']), '')
+                'supervisor_name': sup_map.get(_safe_int(a['supervisor_id']), '')
             })
     records.sort(key=lambda x: str(x['scan_time']), reverse=True)
     return jsonify(records)
@@ -921,7 +1574,7 @@ if __name__ == '__main__':
             f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
 
     print("=" * 50)
-    print("  NFC Attendance System")
+    print("  NFC Attendance System - Sunday School")
     print("=" * 50)
     print(f"  Phone:   https://{local_ip}:5000")
     print("=" * 50)
@@ -937,13 +1590,21 @@ if __name__ == '__main__':
     )
     flask_thread.start()
 
-    # Open pywebview standalone window (desktop app)
+    # Auto-login as master admin for the pywebview desktop session
+    # We do this by injecting the admin secret via a custom JS bridge
     import webview
+
+    class MasterAdminApi:
+        def get_admin_secret(self):
+            return MASTER_ADMIN_SECRET
+
+    api = MasterAdminApi()
     webview.create_window(
-        'خدمة اعدادي - NFC Attendance',
+        'مدارس الاحد - NFC Attendance',
         'https://localhost:5000',
         width=420, height=780,
         resizable=True,
-        min_size=(360, 600)
+        min_size=(360, 600),
+        js_api=api
     )
     webview.start(ssl=True)
