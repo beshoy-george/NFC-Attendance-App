@@ -1,0 +1,4 @@
+{
+    "python.locator": "js",
+    "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe"
+}

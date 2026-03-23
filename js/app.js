@@ -1,4 +1,4 @@
-﻿/* NFC Attendance - Multi-service (Offline-First) */
+/* NFC Attendance - Multi-service (Offline-First) */
 const state={supervisor:null,isMasterAdmin:false,employees:[],services:[],stages:[],currentView:'dashboard',previousView:null,selectedDate:getNearestFriday(),scanDate:getNearestFriday(),attDate:getNearestFriday(),scanning:false,nfcReader:null,nfcAbortController:null,scanCount:0,weeklyChart:null,currentFilter:'all',classFilter:'all',editingEmployee:null,birthdayDays:7,_attendanceRecords:null,offline:!navigator.onLine};
 const PENDING_SCAN_KEY='pending_nfc_scans_v1';
 const SUPERVISOR_CACHE_KEY='cached_supervisor_v1';
@@ -618,9 +618,18 @@ function filterAttendance(filter){
     const statusClass=r.status==='present'?'badge-present':r.status==='absent'?'badge-absent':'badge-pending';
     const statusText=r.status==='present'?'حاضر':r.status==='absent'?'غائب':'لم يُسجل';
     const time=r.scan_time?r.scan_time.split(' ')[1]||'':''
+    
+    let waBtn = '';
+    if (r.status==='absent' && emp.parent_phone) {
+       let phone = emp.parent_phone;
+       if(phone.startsWith('0')) phone = '2' + phone; 
+       const msg = encodeURIComponent('سلام ونعمة، افتقدنا ' + emp.name + ' في مدارس الأحد، نتمنى أن يكون بخير.');
+       waBtn = '<a href="https://wa.me/' + phone + '?text=' + msg + '" target="_blank" class="btn btn-icon" style="color:#25D366;margin-right:8px;font-size:1.3rem;margin-bottom:auto;margin-top:auto;" onclick="event.stopPropagation()"><i class="fab fa-whatsapp"></i></a>';
+    }
+
     return '<div class="card-item" onclick="showProfile('+emp.id+')">'+
       '<div class="card-avatar" style="background:'+color+';color:#fff">'+initial+'</div>'+
-      '<div class="card-body"><h3>'+emp.name+'</h3><p>'+time+'</p></div>'+
+      '<div class="card-body"><h3>'+emp.name+'</h3><p>'+time+'</p></div>'+ waBtn +
       '<span class="card-badge '+statusClass+'">'+statusText+'</span></div>';
   }).join('');
 }
@@ -1167,16 +1176,32 @@ async function deleteStage(id){
 }
 
 // ===== EXPORT =====
-async function exportAttendance(){
+function showReportModal() {
+  const d = new Date();
+  document.getElementById('reportEndDate').value = d.toISOString().split('T')[0];
+  d.setDate(d.getDate() - 30);
+  document.getElementById('reportStartDate').value = d.toISOString().split('T')[0];
+  document.getElementById('reportModal').classList.remove('hidden');
+}
+
+function closeReportModal() {
+  document.getElementById('reportModal').classList.add('hidden');
+}
+
+async function generateReport(){
+  const start = document.getElementById('reportStartDate').value;
+  const end = document.getElementById('reportEndDate').value;
+  if(!start || !end) { showToast('يرجى تحديد التواريخ', 'warning'); return; }
+
   showLoading();
   try{
-    const res=await fetch(buildUrl('/api/attendance/report'));
+    const res=await fetch(buildUrl('/api/attendance/report', {start: start, end: end}));
     if(!res.ok){showToast('خطأ','error');hideLoading();return;}
     const records=await res.json();
     if(!records.length){showToast('لا توجد سجلات للتصدير','warning');hideLoading();return;}
     // Build CSV
     let csv='\uFEFF'; // BOM for Arabic
-    csv+='الاسم,معرف NFC,الحالة,الوقت,الخادم,ملاحظات\n';
+    csv+='الاسم,معرف NFC,الحالة,التاريخ والوقت,الخادم,ملاحظات\n';
     records.forEach(function(r){
       const status=r.status==='present'?'حاضر':'غائب';
       csv+='"'+(r.employee_name||'')+'",'+(r.nfc_uid||'')+','+status+',"'+(r.scan_time||'')+'","'+(r.supervisor_name||'')+'","'+(r.notes||'')+'"\n';
@@ -1188,6 +1213,7 @@ async function exportAttendance(){
     document.body.appendChild(a);a.click();document.body.removeChild(a);
     URL.revokeObjectURL(url);
     showToast('تم تصدير التقرير','success');
+    closeReportModal();
   }catch(e){showToast('خطأ في التصدير','error');}
   hideLoading();
 }

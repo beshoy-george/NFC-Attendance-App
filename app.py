@@ -1,15 +1,15 @@
-﻿"""
+"""
 NFC Attendance System - Backend
 Excel-based database + pywebview standalone window
 Supports multiple services (خدمات) and stages (مراحل) under Sunday School.
 Master admin = the desktop (pywebview) session.
 """
 
-from flask import Flask, jsonify, request, send_from_directory, session
-from werkzeug.security import generate_password_hash, check_password_hash
+from flask import Flask, jsonify, request, send_from_directory, session # pyre-ignore
+from werkzeug.security import generate_password_hash, check_password_hash # pyre-ignore
 from functools import wraps
-from flask_cors import CORS
-from openpyxl import Workbook, load_workbook
+from flask_cors import CORS # pyre-ignore
+from openpyxl import Workbook, load_workbook # pyre-ignore
 import threading
 import os
 import sys
@@ -28,7 +28,7 @@ app.secret_key = os.environ.get('SECRET_KEY', 'nfc-attendance-secret-key-change-
 # and the bundled _MEIPASS directory for static assets
 if getattr(sys, 'frozen', False):
     RUN_DIR = os.path.dirname(sys.executable)
-    BASE_DIR = sys._MEIPASS
+    BASE_DIR = getattr(sys, '_MEIPASS', RUN_DIR)
 else:
     RUN_DIR = os.path.dirname(os.path.abspath(__file__))
     BASE_DIR = RUN_DIR
@@ -218,7 +218,8 @@ def _sheet_to_dicts(ws):
         return []
     headers = [str(h) for h in rows[0]]
     result = []
-    for row in rows[1:]:
+    for i in range(1, len(rows)):
+        row = rows[i]
         if row[0] is None:
             continue
         d = {}
@@ -364,7 +365,8 @@ def _get_next_birthday(birthdate_str):
     if not birthdate_str or birthdate_str == '':
         return ''
     try:
-        bd = datetime.strptime(str(birthdate_str).strip()[:10], '%Y-%m-%d').date()
+        bd_str = str(birthdate_str).strip().split('T')[0].split(' ')[0]
+        bd = datetime.strptime(bd_str, '%Y-%m-%d').date()
     except (ValueError, TypeError):
         return ''
     today = date.today()
@@ -615,12 +617,12 @@ def login():
         ws = wb['Supervisors']
         supervisors = _sheet_to_dicts(ws)
         wb.close()
-    supervisor = None
+    supervisor = {}
     for s in supervisors:
-        if normalize_phone(s['phone']) == phone:
+        if normalize_phone(s.get('phone', '')) == phone:
             supervisor = s
             break
-    if not supervisor or not check_password_hash(supervisor['password_hash'], password):
+    if not supervisor or not check_password_hash(supervisor.get('password_hash', ''), password):
         return jsonify({'error': 'Invalid credentials'}), 401
     session.permanent = True
     session['supervisor_id'] = int(supervisor['id'])
@@ -681,7 +683,7 @@ def forgot_password_request_otp():
     if not sms_result.get('sent'):
         return jsonify({'error': sms_result.get('error', 'Failed to send OTP')}), 500
 
-    response = {
+    response: dict = {
         'message': f'OTP has been sent. It expires in {OTP_TTL_MINUTES} minutes.'
     }
     if sms_result.get('simulated'):
@@ -772,17 +774,17 @@ def auth_me():
         ws = wb['Supervisors']
         supervisors = _sheet_to_dicts(ws)
         wb.close()
-    supervisor = None
+    supervisor = {}
     for s in supervisors:
-        if int(s['id']) == session['supervisor_id']:
+        if int(s.get('id', 0)) == session['supervisor_id']:
             supervisor = s
             break
     if not supervisor:
         session.clear()
         return jsonify({'authenticated': False}), 401
     return jsonify({'authenticated': True, 'supervisor': {
-        'id': int(supervisor['id']), 'name': supervisor['name'],
-        'phone': supervisor['phone'],
+        'id': int(supervisor.get('id', 0)), 'name': supervisor.get('name', ''),
+        'phone': supervisor.get('phone', ''),
         'service_id': _safe_int(supervisor.get('service_id')),
         'stage_id': _safe_int(supervisor.get('stage_id')),
     }})
@@ -904,9 +906,9 @@ def nfc_scan():
         wb = _load_wb()
         ws_emp = wb['Employees']
         employees = _sheet_to_dicts(ws_emp)
-        employee = None
+        employee = {}
         for e in employees:
-            if str(e['nfc_uid']).upper() == nfc_uid:
+            if str(e.get('nfc_uid', '')).upper() == nfc_uid:
                 employee = e
                 break
         if not employee:
@@ -917,10 +919,11 @@ def nfc_scan():
         attendance = _sheet_to_dicts(ws_att)
         day_start = scan_date + ' 00:00:00'
         day_end = scan_date + ' 23:59:59'
-        existing = None
+        existing = {}
         for a in attendance:
-            if (int(a['employee_id']) == int(employee['id']) and
-                    str(a['scan_time']) >= day_start and str(a['scan_time']) <= day_end):
+            scan_t = str(a.get('scan_time', ''))
+            if (int(a.get('employee_id', 0)) == int(employee.get('id', 0)) and
+                    day_start <= scan_t and scan_t <= day_end):
                 existing = a
                 break
         if existing:
@@ -928,8 +931,8 @@ def nfc_scan():
             emp_dict = {k: (int(v) if k == 'id' else v) for k, v in employee.items()}
             return jsonify({
                 'status': 'already_scanned', 'employee': emp_dict,
-                'scan_time': existing['scan_time'],
-                'message': employee['name'] + ' already scanned'
+                'scan_time': existing.get('scan_time', ''),
+                'message': str(employee.get('name', '')) + ' already scanned'
             })
         # Record attendance
         now_time = datetime.now().strftime('%H:%M:%S')
@@ -963,17 +966,18 @@ def manual_attendance():
         attendance = _sheet_to_dicts(ws_att)
         day_start = record_date + ' 00:00:00'
         day_end = record_date + ' 23:59:59'
-        existing = None
+        existing = {}
         for a in attendance:
-            if (int(a['employee_id']) == employee_id and
-                    str(a['scan_time']) >= day_start and str(a['scan_time']) <= day_end):
+            scan_t = str(a.get('scan_time', ''))
+            if (int(a.get('employee_id', 0)) == employee_id and
+                    day_start <= scan_t and scan_t <= day_end):
                 existing = a
                 break
         now_time = datetime.now().strftime('%H:%M:%S')
         record_time = record_date + ' ' + now_time
         sup_id = session.get('supervisor_id', -1)
         if existing:
-            row_num = _find_row_by_id(ws_att, existing['id'])
+            row_num = _find_row_by_id(ws_att, existing.get('id', 0))
             if row_num:
                 headers = _get_headers(ws_att)
                 ws_att.cell(row=row_num, column=headers.index('status') + 1, value=status)
@@ -1088,16 +1092,17 @@ def get_employee(emp_id):
     today = date.today()
     for i in range(12):
         friday = get_nearest_friday(today - timedelta(weeks=i))
-        fri_start = friday.isoformat() + ' 00:00:00'
-        fri_end = friday.isoformat() + ' 23:59:59'
-        record = None
+        fri_start = str(friday) + ' 00:00:00'
+        fri_end = str(friday) + ' 23:59:59'
+        record = {}
         for a in attendance:
-            if fri_start <= str(a['scan_time']) <= fri_end:
+            scan_t = str(a.get('scan_time', ''))
+            if fri_start <= scan_t and scan_t <= fri_end:
                 record = a
                 break
         weekly.append({
-            'date': friday.isoformat(),
-            'status': record['status'] if record else 'absent'
+            'date': str(friday),
+            'status': record.get('status', 'absent') if record else 'absent'
         })
 
     # Compute next birthday and last visit
@@ -1109,7 +1114,7 @@ def get_employee(emp_id):
         'attendance': attendance,
         'stats': {
             'total_records': total_records, 'present': present_count, 'absent': absent_count,
-            'rate': round((present_count / total_records * 100) if total_records > 0 else 0, 1)
+            'rate': round(float((present_count * 100.0 / total_records) if total_records > 0 else 0.0), 1) # pyre-ignore
         },
         'weekly': weekly,
         'next_birthday': next_birthday,
@@ -1293,7 +1298,8 @@ def upcoming_birthdays():
         if not bd_str:
             continue
         try:
-            bd = datetime.strptime(bd_str[:10], '%Y-%m-%d').date()
+            bd_str_clean = bd_str.split('T')[0].split(' ')[0]
+            bd = datetime.strptime(bd_str_clean, '%Y-%m-%d').date()
         except (ValueError, TypeError):
             continue
         this_year_bd = bd.replace(year=today.year)
@@ -1350,10 +1356,12 @@ def dashboard():
     emp_map = {int(e['id']): e['name'] for e in employees}
     sup_map = {int(s['id']): s['name'] for s in supervisors}
     recent = []
-    for a in sorted(day_records, key=lambda x: str(x['scan_time']), reverse=True)[:20]:
+    sorted_records = sorted(day_records, key=lambda x: str(x.get('scan_time', '')), reverse=True)
+    for i in range(min(20, len(sorted_records))):
+        a = sorted_records[i]
         recent.append({
-            'employee_id': int(a['employee_id']),
-            'employee_name': emp_map.get(int(a['employee_id']), ''),
+            'employee_id': int(a.get('employee_id', 0)),
+            'employee_name': emp_map.get(int(a.get('employee_id', 0)), ''),
             'nfc_uid': next((e.get('nfc_uid', '') for e in employees if int(e['id']) == int(a['employee_id'])), ''),
             'supervisor_name': sup_map.get(_safe_int(a['supervisor_id']), ''),
             'scan_time': a['scan_time'], 'status': a['status']
@@ -1389,20 +1397,21 @@ def attendance_by_date():
     day_end = target_date + ' 23:59:59'
     sup_map = {int(s['id']): s['name'] for s in supervisors}
     result = []
-    for emp in sorted(employees, key=lambda x: x['name']):
-        record = None
+    for emp in sorted(employees, key=lambda x: x.get('name', '')):
+        record = {}
         for a in attendance:
-            if (int(a['employee_id']) == int(emp['id']) and
-                    day_start <= str(a['scan_time']) <= day_end):
+            scan_t = str(a.get('scan_time', ''))
+            if (int(a.get('employee_id', 0)) == int(emp.get('id', 0)) and
+                    day_start <= scan_t and scan_t <= day_end):
                 record = a
                 break
         emp_dict = dict(emp)
-        emp_dict['id'] = int(emp_dict['id'])
+        emp_dict['id'] = int(emp_dict.get('id', 0))
         result.append({
             'employee': emp_dict,
-            'status': record['status'] if record else 'not_scanned',
-            'scan_time': record['scan_time'] if record else None,
-            'supervisor': sup_map.get(_safe_int(record['supervisor_id']), '') if record else None
+            'status': record.get('status', 'not_scanned') if record else 'not_scanned',
+            'scan_time': record.get('scan_time') if record else None,
+            'supervisor': sup_map.get(_safe_int(record.get('supervisor_id', 0)), '') if record else None
         })
     return jsonify(result)
 
@@ -1421,20 +1430,21 @@ def today_attendance():
     day_end = today_str + ' 23:59:59'
     sup_map = {int(s['id']): s['name'] for s in supervisors}
     result = []
-    for emp in sorted(employees, key=lambda x: x['name']):
-        record = None
+    for emp in sorted(employees, key=lambda x: x.get('name', '')):
+        record = {}
         for a in attendance:
-            if (int(a['employee_id']) == int(emp['id']) and
-                    day_start <= str(a['scan_time']) <= day_end):
+            scan_t = str(a.get('scan_time', ''))
+            if (int(a.get('employee_id', 0)) == int(emp.get('id', 0)) and
+                    day_start <= scan_t and scan_t <= day_end):
                 record = a
                 break
         emp_dict = dict(emp)
-        emp_dict['id'] = int(emp_dict['id'])
+        emp_dict['id'] = int(emp_dict.get('id', 0))
         result.append({
             'employee': emp_dict,
-            'status': record['status'] if record else 'not_scanned',
-            'scan_time': record['scan_time'] if record else None,
-            'supervisor': sup_map.get(_safe_int(record['supervisor_id']), '') if record else None
+            'status': record.get('status', 'not_scanned') if record else 'not_scanned',
+            'scan_time': record.get('scan_time') if record else None,
+            'supervisor': sup_map.get(_safe_int(record.get('supervisor_id', 0)), '') if record else None
         })
     return jsonify(result)
 
@@ -1466,19 +1476,19 @@ def analytics():
         friday = get_nearest_friday(today - timedelta(weeks=i))
         fri_start = friday.isoformat() + ' 00:00:00'
         fri_end = friday.isoformat() + ' 23:59:59'
-        day_records = [a for a in attendance if fri_start <= str(a['scan_time']) <= fri_end]
-        present = sum(1 for a in day_records if a['status'] == 'present')
-        absent = sum(1 for a in day_records if a['status'] == 'absent')
+        day_records = [a for a in attendance if fri_start <= str(a.get('scan_time', '')) <= fri_end]
+        present = sum(1 for a in day_records if a.get('status') == 'present')
+        absent = sum(1 for a in day_records if a.get('status') == 'absent')
         weekly_trend.append({
             'date': friday.isoformat(), 'present': present, 'absent': absent, 'total': total_employees
         })
     # Per-attendee stats
     attendee_stats = []
     for emp in employees:
-        emp_att = [a for a in attendance if int(a['employee_id']) == int(emp['id'])]
-        present = sum(1 for a in emp_att if a['status'] == 'present')
+        emp_att = [a for a in attendance if int(a.get('employee_id', 0)) == int(emp.get('id', 0))]
+        present = sum(1 for a in emp_att if a.get('status') == 'present')
         total = len(emp_att)
-        rate = round((present / total * 100) if total > 0 else 0, 1)
+        rate = round(float((present * 100.0 / total) if total > 0 else 0.0), 1) # pyre-ignore
         attendee_stats.append({
             'id': int(emp['id']), 'name': emp['name'], 'class_name': emp.get('department', ''),
             'present': present, 'total': total, 'rate': rate
@@ -1491,18 +1501,18 @@ def analytics():
         if cls not in classes:
             classes[cls] = {'name': cls, 'count': 0, 'total_present': 0, 'total_records': 0}
         classes[cls]['count'] += 1
-        emp_att = [a for a in attendance if int(a['employee_id']) == int(emp['id'])]
-        present = sum(1 for a in emp_att if a['status'] == 'present')
+        emp_att = [a for a in attendance if int(a.get('employee_id', 0)) == int(emp.get('id', 0))]
+        present = sum(1 for a in emp_att if a.get('status') == 'present')
         classes[cls]['total_present'] += present
         classes[cls]['total_records'] += len(emp_att)
     class_stats = []
     for cls_data in classes.values():
-        rate = round((cls_data['total_present'] / cls_data['total_records'] * 100) if cls_data['total_records'] > 0 else 0, 1)
+        rate = round(float((cls_data['total_present'] * 100.0 / cls_data['total_records']) if cls_data['total_records'] > 0 else 0.0), 1) # pyre-ignore
         class_stats.append({**cls_data, 'rate': rate})
     # Overall
     total_attendance = len(attendance)
-    total_present = sum(1 for a in attendance if a['status'] == 'present')
-    overall_rate = round((total_present / total_attendance * 100) if total_attendance > 0 else 0, 1)
+    total_present = sum(1 for a in attendance if a.get('status') == 'present')
+    overall_rate = round(float((total_present * 100.0 / total_attendance) if total_attendance > 0 else 0.0), 1) # pyre-ignore
     return jsonify({
         'total_employees': total_employees, 'overall_rate': overall_rate,
         'total_attendance_records': total_attendance, 'total_present': total_present,
@@ -1557,7 +1567,7 @@ if __name__ == '__main__':
     cert_file = os.path.join(RUN_DIR, 'cert.pem')
     key_file = os.path.join(RUN_DIR, 'key.pem')
     if not os.path.exists(cert_file) or not os.path.exists(key_file):
-        from OpenSSL import crypto
+        from OpenSSL import crypto # pyre-ignore
         k = crypto.PKey()
         k.generate_key(crypto.TYPE_RSA, 2048)
         cert = crypto.X509()
@@ -1592,7 +1602,7 @@ if __name__ == '__main__':
 
     # Auto-login as master admin for the pywebview desktop session
     # We do this by injecting the admin secret via a custom JS bridge
-    import webview
+    import webview # pyre-ignore
 
     class MasterAdminApi:
         def get_admin_secret(self):

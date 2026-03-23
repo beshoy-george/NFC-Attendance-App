@@ -369,9 +369,9 @@
           <span>إدارة الخدمات والمراحل</span>
           <i class="fas fa-chevron-left"></i>
         </div>
-        <div class="settings-item" onclick="exportAttendance()">
+        <div class="settings-item" onclick="showReportModal()">
           <i class="fas fa-file-export"></i>
-          <span>تصدير التقرير</span>
+          <span>إصدار تقرير متقدم</span>
           <i class="fas fa-chevron-left"></i>
         </div>
       </div>
@@ -435,6 +435,31 @@
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeEmployeeModal()">إلغاء</button>
       <button class="btn btn-primary" id="modalSaveBtn"><i class="fas fa-save"></i> حفظ</button>
+    </div>
+  </div>
+</div>
+
+<!-- REPORT MODAL -->
+<div id="reportModal" class="modal hidden">
+  <div class="modal-backdrop" onclick="closeReportModal()"></div>
+  <div class="modal-content">
+    <div class="modal-header">
+      <h2>إصدار تقرير متقدم</h2>
+      <button class="btn btn-icon" onclick="closeReportModal()"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>من تاريخ (Start Date)</label>
+        <input type="date" id="reportStartDate" />
+      </div>
+      <div class="form-group">
+        <label>إلى تاريخ (End Date)</label>
+        <input type="date" id="reportEndDate" />
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeReportModal()">إلغاء</button>
+      <button class="btn btn-primary" onclick="generateReport()"><i class="fas fa-file-excel"></i> تصدير (CSV)</button>
     </div>
   </div>
 </div>
